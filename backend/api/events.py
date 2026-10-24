@@ -59,6 +59,17 @@ def _events_scope(request: Request) -> str | None:
     return tenant_scope(request)
 
 
+def _org_condition(model, request: Request) -> tuple:
+    """Org predicate for a telemetry table (empty tuple for admins).
+
+    Every process/network/DNS/HTTP row carries an ``org`` tag, so analysts
+    must never see another organization's records even though these endpoints
+    do not paginate through ``NormalizedEvent``.
+    """
+    scope = _events_scope(request)
+    return () if scope is None else (model.org == scope,)
+
+
 @router.get("/events")
 def list_events(
     request: Request,
@@ -143,23 +154,29 @@ def get_event(event_id: int, request: Request, db: Session = Depends(get_db)):
 
 @router.get("/processes")
 def list_processes(
-    limit: int = Query(200, ge=1, le=1000), db: Session = Depends(get_db)
+    request: Request,
+    limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
 ):
     rows = db.scalars(
-        select(ProcessRecord).order_by(ProcessRecord.observed_at.desc()).limit(limit)
+        select(ProcessRecord)
+        .where(*_org_condition(ProcessRecord, request))
+        .order_by(ProcessRecord.observed_at.desc())
+        .limit(limit)
     ).all()
     return {"total": len(rows), "items": [p.to_dict() for p in rows]}
 
 
 @router.get("/network")
 def list_network(
+    request: Request,
     limit: int = Query(500, ge=1, le=2000),
     remote_ip: str | None = None,
     since: str | None = None,
     direction: str | None = None,
     db: Session = Depends(get_db),
 ):
-    stmt = select(NetworkConnection)
+    stmt = select(NetworkConnection).where(*_org_condition(NetworkConnection, request))
     if remote_ip:
         stmt = stmt.where(NetworkConnection.remote_ip == remote_ip)
     if since:
@@ -210,11 +227,12 @@ def list_network(
 
 @router.get("/dns")
 def list_dns(
+    request: Request,
     limit: int = Query(200, ge=1, le=1000),
     process: str | None = None,
     db: Session = Depends(get_db),
 ):
-    stmt = select(DnsQuery)
+    stmt = select(DnsQuery).where(*_org_condition(DnsQuery, request))
     if process:
         stmt = stmt.where(DnsQuery.process.ilike(f"%{_safe_like(process)}%"))
     rows = db.scalars(stmt.order_by(DnsQuery.observed_at.desc()).limit(limit)).all()
@@ -223,12 +241,13 @@ def list_dns(
 
 @router.get("/http")
 def list_http(
+    request: Request,
     limit: int = Query(200, ge=1, le=1000),
     host: str | None = None,
     method: str | None = None,
     db: Session = Depends(get_db),
 ):
-    stmt = select(HttpRequest)
+    stmt = select(HttpRequest).where(*_org_condition(HttpRequest, request))
     if host:
         stmt = stmt.where(HttpRequest.host.ilike(f"%{_safe_like(host)}%"))
     if method:
@@ -238,19 +257,29 @@ def list_http(
 
 
 @router.get("/network/stats")
-def network_stats(db: Session = Depends(get_db)):
+def network_stats(request: Request, db: Session = Depends(get_db)):
     """Aggregated network stats for the traffic analyzer dashboard."""
+    net = _org_condition(NetworkConnection, request)
+    dns = _org_condition(DnsQuery, request)
+    http = _org_condition(HttpRequest, request)
+
     # Total counts
-    conn_count = db.scalar(select(func.count(NetworkConnection.id))) or 0
-    dns_count = db.scalar(select(func.count(DnsQuery.id))) or 0
-    http_count = db.scalar(select(func.count(HttpRequest.id))) or 0
+    conn_count = db.scalar(select(func.count(NetworkConnection.id)).where(*net)) or 0
+    dns_count = db.scalar(select(func.count(DnsQuery.id)).where(*dns)) or 0
+    http_count = db.scalar(select(func.count(HttpRequest.id)).where(*http)) or 0
 
     # Bandwidth totals
     total_sent = (
-        db.scalar(select(func.coalesce(func.sum(NetworkConnection.bytes_sent), 0))) or 0
+        db.scalar(
+            select(func.coalesce(func.sum(NetworkConnection.bytes_sent), 0)).where(*net)
+        )
+        or 0
     )
     total_recv = (
-        db.scalar(select(func.coalesce(func.sum(NetworkConnection.bytes_recv), 0))) or 0
+        db.scalar(
+            select(func.coalesce(func.sum(NetworkConnection.bytes_recv), 0)).where(*net)
+        )
+        or 0
     )
 
     # Top remote IPs by connection count
@@ -258,7 +287,7 @@ def network_stats(db: Session = Depends(get_db)):
         select(
             NetworkConnection.remote_ip, func.count(NetworkConnection.id).label("cnt")
         )
-        .where(NetworkConnection.remote_ip != "")
+        .where(NetworkConnection.remote_ip != "", *net)
         .group_by(NetworkConnection.remote_ip)
         .order_by(func.count(NetworkConnection.id).desc())
         .limit(10)
@@ -269,7 +298,7 @@ def network_stats(db: Session = Depends(get_db)):
         select(
             NetworkConnection.remote_port, func.count(NetworkConnection.id).label("cnt")
         )
-        .where(NetworkConnection.remote_port > 0)
+        .where(NetworkConnection.remote_port > 0, *net)
         .group_by(NetworkConnection.remote_port)
         .order_by(func.count(NetworkConnection.id).desc())
         .limit(10)
@@ -278,7 +307,7 @@ def network_stats(db: Session = Depends(get_db)):
     # Top processes by connection count
     top_processes = db.execute(
         select(NetworkConnection.process, func.count(NetworkConnection.id).label("cnt"))
-        .where(NetworkConnection.process != "")
+        .where(NetworkConnection.process != "", *net)
         .group_by(NetworkConnection.process)
         .order_by(func.count(NetworkConnection.id).desc())
         .limit(10)
@@ -287,6 +316,7 @@ def network_stats(db: Session = Depends(get_db)):
     # Top DNS query domains
     top_dns = db.execute(
         select(DnsQuery.query, func.count(DnsQuery.id).label("cnt"))
+        .where(*dns)
         .group_by(DnsQuery.query)
         .order_by(func.count(DnsQuery.id).desc())
         .limit(10)
@@ -295,7 +325,7 @@ def network_stats(db: Session = Depends(get_db)):
     # Top HTTP hosts
     top_hosts = db.execute(
         select(HttpRequest.host, func.count(HttpRequest.id).label("cnt"))
-        .where(HttpRequest.host != "")
+        .where(HttpRequest.host != "", *http)
         .group_by(HttpRequest.host)
         .order_by(func.count(HttpRequest.id).desc())
         .limit(10)
@@ -304,7 +334,7 @@ def network_stats(db: Session = Depends(get_db)):
     # Connection state distribution
     state_dist = db.execute(
         select(NetworkConnection.state, func.count(NetworkConnection.id).label("cnt"))
-        .where(NetworkConnection.state != "")
+        .where(NetworkConnection.state != "", *net)
         .group_by(NetworkConnection.state)
         .order_by(func.count(NetworkConnection.id).desc())
     ).all()
