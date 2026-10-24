@@ -44,13 +44,12 @@ development laboratory.
 
 - The session cookie is forced to `Secure` whenever TLS is enabled.
 
-- Default bootstrap credentials (`admin`/`baraqadmin`) are seeded with the
-
-  `must_change_password` flag; the console blocks all other endpoints until
-
-  the operator changes the password, and the new password may not equal the
-
-  default.
+- First-run credentials are generated randomly per installation and written
+  to `first_run_credentials.txt` next to the executable (the password is also
+  stored in the DPAPI vault). The bootstrap account carries
+  `must_change_password`, so the console blocks all other endpoints until the
+  operator changes the password; the handoff file is then deleted
+  automatically.
 
 
 

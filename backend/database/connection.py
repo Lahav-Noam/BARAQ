@@ -12,6 +12,7 @@ import logging
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker
 
+from backend.config import DATABASE_URL as CONFIG_DATABASE_URL
 from backend.database.models import (
     Alert,
     Base,
@@ -32,6 +33,13 @@ from backend.settings import get_settings
 
 logger = logging.getLogger("baraq.db")
 settings = get_settings()
+
+#: Prefer the vault-aware config value over the pydantic settings object.
+#: ``backend.config.DATABASE_URL`` is resolved through ``_secret()``, which
+#: reads the DPAPI/AES vault as well as the environment; ``settings.database_url``
+#: only ever sees the environment. Without this, a deployment that stores the
+#: database URL solely in the vault fails to start or connects to the wrong DB.
+_DATABASE_URL = CONFIG_DATABASE_URL or settings.database_url
 
 
 def normalize_database_url(url: str) -> str:
@@ -192,7 +200,7 @@ def _ddl_default(ddl_type: str) -> str:
 
 # Create the engine with connection pooling settings from the configuration.
 engine = create_engine(
-    normalize_database_url(settings.database_url),
+    normalize_database_url(_DATABASE_URL),
     echo=settings.echo_sql,
     pool_pre_ping=True,
     pool_size=settings.db_pool_size,
@@ -552,7 +560,7 @@ def init_db() -> None:
 
     logger.info(
         "Database initialised at %s",
-        make_url(settings.database_url).render_as_string(hide_password=True),
+        make_url(_DATABASE_URL).render_as_string(hide_password=True),
     )
 
 

@@ -8,7 +8,8 @@ This guide covers security hardening recommendations for BARAQ deployments.
 
 - Enforce minimum 8 characters with uppercase, lowercase, and digits
 - Use unique passwords for each account
-- Change default admin password immediately on first login
+- Change the generated admin password immediately on first login (read it
+  from `first_run_credentials.txt`; the file is deleted after the change)
 
 ### Multi-Factor Authentication (MFA)
 

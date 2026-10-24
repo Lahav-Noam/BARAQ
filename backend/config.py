@@ -68,10 +68,21 @@ IS_PRODUCTION = BARAQ_ENV == "production"
 #: The project .env file (next to this file's parent, i.e. project root).
 ENV_PATH = APP_DIR / ".env"
 
-#: Well-known first-run password. Fresh installs seed the admin with this and
-#: mark the account (must_change_password) so the console forces the operator
-#: to replace it before use. Generated randomly per install — never hardcoded.
+#: Generated randomly per install - never hardcoded. Fresh installs seed the
+#: admin with this and mark the account (must_change_password) so the console
+#: forces the operator to replace it before use.
 DEFAULT_ADMIN_PASSWORD = _secrets.token_urlsafe(16)
+
+#: Retired well-known bootstrap password. Release builds before 1.0.9 bundled
+#: this value into a shared ``dist/.env`` seed; it is detected and rotated on
+#: startup so an upgraded install cannot keep a credential that every other
+#: copy of the same build also knows.
+INSECURE_BOOTSTRAP_PASSWORD = "baraqadmin"
+
+#: One-time credential handoff for windowed/packaged installs, written next to
+#: the executable when random credentials are generated. Deleted as soon as
+#: the admin changes the password (see ``clear_first_run_credentials``).
+FIRST_RUN_CREDENTIALS_PATH = APP_DIR / "first_run_credentials.txt"
 
 #: These are *names* of environment variables, kept in one place so the
 #: marker check below and the persisted .env block always stay in sync.
@@ -93,34 +104,6 @@ _LEGACY_PREFIX = "SENTINEL_"
 def _legacy_name(name: str) -> str:
     """Map a BARAQ_* secret name back to its pre-rename SENTINEL_* form."""
     return _LEGACY_PREFIX + name[len("BARAQ_") :] if name.startswith("BARAQ_") else name
-
-
-def _seeded_values_from_bundle():
-    """Return operator-bundled credentials embedded in the executable.
-
-    The PyInstaller spec bundles ``dist/.env`` as ``.env.seed`` inside the
-    exe, so a fully standalone build boots with known credentials on any
-    machine - no .env file required. Returns None in development or when
-    the seed is incomplete, falling back to random generation.
-    """
-    seed = BUNDLE_DIR / "seed" / ".env"
-    try:
-        text = seed.read_text(encoding="utf-8-sig")
-    except OSError:
-        return None
-    values = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key in _first_run_vars and value:
-            values[key] = value
-    if set(values) == set(_first_run_vars):
-        return values
-    return None
 
 
 def _get_vault():
@@ -186,6 +169,96 @@ def _migrate_env_secrets_to_vault(vault, env_path: Path) -> None:
             pass
 
 
+def _strip_env_first_run_vars(env_path: Path) -> None:
+    """Remove bootstrap credential lines from .env before regenerating them.
+
+    ``_load_dotenv`` is non-overriding, so leaving an old ``baraqadmin`` line
+    in place would make the next process start regenerate credentials again.
+    """
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    kept = [
+        line
+        for line in lines
+        if not (
+            line.strip()
+            and not line.lstrip().startswith("#")
+            and "=" in line
+            and line.partition("=")[0].strip() in _first_run_vars
+        )
+    ]
+    if len(kept) == len(lines):
+        return
+    try:
+        env_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _write_first_run_credentials(values: dict[str, str]) -> bool:
+    """Write the one-time bootstrap credentials next to the executable.
+
+    The encrypted vault is the durable store; this file exists only so a
+    windowed packaged build (no console) can surface the initial password to
+    the operator. It is removed after the first successful password change.
+    """
+    lines = [
+        "BARAQ first-run credentials",
+        "=" * 32,
+        "",
+        "Log in and change the admin password immediately.",
+        "This file is deleted automatically after the password change.",
+        "",
+        f"Username: {os.environ.get('BARAQ_ADMIN_USERNAME', 'admin')}",
+        f"Password: {values.get('BARAQ_ADMIN_PASSWORD', '')}",
+        "",
+    ]
+    try:
+        api_keys = json.loads(values.get("BARAQ_API_KEYS", "{}"))
+    except (TypeError, ValueError):
+        api_keys = {}
+    for key, role in api_keys.items():
+        lines.append(f"{str(role).title()} API key: {key}")
+    try:
+        path = FIRST_RUN_CREDENTIALS_PATH
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        if os.name == "nt":
+            try:
+                import subprocess
+
+                subprocess.run(
+                    [
+                        "icacls",
+                        str(path),
+                        "/inheritance:r",
+                        "/grant:r",
+                        f"{getpass.getuser()}:F",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return True
+    except OSError:
+        return False
+
+
+def clear_first_run_credentials() -> None:
+    """Delete the one-time credential handoff file (best effort)."""
+    try:
+        FIRST_RUN_CREDENTIALS_PATH.unlink()
+    except OSError:
+        pass
+
+
 def _ensure_secure_secrets(env_path: Path = ENV_PATH) -> None:
     """Generate random admin credentials on first run and persist them.
 
@@ -228,38 +301,44 @@ def _ensure_secure_secrets(env_path: Path = ENV_PATH) -> None:
     configured = {
         name: vault.get(name) or os.environ.get(name) for name in _first_run_vars
     }
-    if all(configured.values()):
+    # A shared bootstrap password from a pre-1.0.9 release build is treated as
+    # unconfigured: rotate all three values instead of keeping a credential
+    # every copy of that build knows.
+    insecure_bootstrap = (
+        configured.get("BARAQ_ADMIN_PASSWORD") == INSECURE_BOOTSTRAP_PASSWORD
+    )
+    if all(configured.values()) and not insecure_bootstrap:
         _migrate_env_secrets_to_vault(vault, env_path)
         return
 
-    # Migration: secrets exist in plaintext .env but not yet in the vault.
-    _migrate_env_secrets_to_vault(vault, env_path)
-    if all(vault.get(name) or os.environ.get(name) for name in _first_run_vars):
-        return
+    if not insecure_bootstrap:
+        # Migration: secrets exist in plaintext .env but not yet in the vault.
+        _migrate_env_secrets_to_vault(vault, env_path)
+        if all(vault.get(name) or os.environ.get(name) for name in _first_run_vars):
+            return
 
-    try:
-        existing = env_path.read_text(encoding="utf-8")
-    except OSError:
-        existing = ""
-    if all(name + "=" in existing for name in _first_run_vars):
-        return
+        try:
+            existing = env_path.read_text(encoding="utf-8")
+        except OSError:
+            existing = ""
+        if all(name + "=" in existing for name in _first_run_vars):
+            return
 
     admin_password = DEFAULT_ADMIN_PASSWORD
     admin_key = "baraq-admin-" + _secrets.token_urlsafe(10)
     analyst_key = "baraq-analyst-" + _secrets.token_urlsafe(10)
     api_keys_json = json.dumps({admin_key: "admin", analyst_key: "analyst"})
     token_secret = _secrets.token_hex(32)
+    new_values = {
+        "BARAQ_ADMIN_PASSWORD": admin_password,
+        "BARAQ_API_KEYS": api_keys_json,
+        "BARAQ_TOKEN_SECRET": token_secret,
+    }
 
-    seeded = _seeded_values_from_bundle()
-    if seeded:
-        new_values = seeded
-        print("Using bundled default credentials from the executable.")
-    else:
-        new_values = {
-            "BARAQ_ADMIN_PASSWORD": admin_password,
-            "BARAQ_API_KEYS": api_keys_json,
-            "BARAQ_TOKEN_SECRET": token_secret,
-        }
+    # Remove old bootstrap lines before persisting replacements: _load_dotenv
+    # is non-overriding, so a stale ``baraqadmin`` line would otherwise be
+    # re-read on the next start and trigger another rotation.
+    _strip_env_first_run_vars(env_path)
 
     # Prefer the DPAPI vault; fall back to plaintext .env only when needed.
     stored_in_vault = False
@@ -283,12 +362,19 @@ def _ensure_secure_secrets(env_path: Path = ENV_PATH) -> None:
     for k, v in new_values.items():
         os.environ[k] = v
 
+    credentials_file = _write_first_run_credentials(new_values)
+    if insecure_bootstrap:
+        logger.warning(
+            "Rotated the retired shared bootstrap credentials (admin password, "
+            "API keys and token secret): BARAQ_ADMIN_PASSWORD was the "
+            "well-known 'baraqadmin' value."
+        )
+
     username = os.environ.get("BARAQ_ADMIN_USERNAME", "admin")
     print("=" * 62)
     print("BARAQ first-run setup complete")
     print("=" * 62)
-    if not seeded:
-        print("Random credentials were generated ")
+    print("Random credentials were generated ")
     if stored_in_vault:
         print("and stored encrypted in secrets.dat")
         print(f"  ({ENV_PATH.parent / 'secrets.dat'})")
@@ -298,7 +384,12 @@ def _ensure_secure_secrets(env_path: Path = ENV_PATH) -> None:
     # Show partial password to avoid full credential in logs/CI output
     masked = admin_password[:3] + "***" + admin_password[-2:] if len(admin_password) > 5 else "***"
     print(f"  Dashboard login : {username} / {masked}")
-    print(f"  (Full password stored in {'secrets.dat vault' if stored_in_vault else str(env_path)})")
+    if credentials_file:
+        print(f"  Full credentials: {FIRST_RUN_CREDENTIALS_PATH}")
+        print("  (delete after changing the password; removed automatically)")
+    else:
+        print(f"  Full password   : {admin_password}")
+        print("  (first_run_credentials.txt could not be written - save it now)")
     print(f"  Admin API key   : {admin_key[:10]}...")
     print(f"  Analyst API key : {analyst_key[:12]}...")
     print()
@@ -1086,7 +1177,7 @@ def _assert_production_safe() -> None:
             "credentials: set BARAQ_ADMIN_PASSWORD and BARAQ_API_KEYS "
             "via the environment, .env or the DPAPI vault before starting."
         )
-    if ADMIN_PASSWORD in ("baraqadmin", ""):
+    if ADMIN_PASSWORD in (INSECURE_BOOTSTRAP_PASSWORD, ""):
         raise RuntimeError(
             "Production mode refuses the well-known bootstrap password. Set "
             "BARAQ_ADMIN_PASSWORD to a strong unique value before starting."
