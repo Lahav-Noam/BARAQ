@@ -9,7 +9,6 @@
 #   dist\BARAQ\                      server (folder layout, console)
 #   dist\BARAQAgent.exe                 fleet agent (single file)
 #   dist\baraq-agent-package\           agent + sample config + install guide
-#   dist\.env                              sealed first-run credential seed
 #   dist\BARAQ-Installer.exe         Inno Setup installer (if ISCC found)
 param(
     [switch]$SkipFrontend,
@@ -41,38 +40,7 @@ function Build-Frontend {
     if ($LASTEXITCODE -ne 0) { throw "npm build failed" }
 }
 
-function New-SeedEnv {
-    # Sealed first-run credentials embedded in the executables - the product
-    # boots with these on every machine (preferred over random generation).
-    # The admin password is the well-known default: fresh installs seed the
-    # account with it and the console forces a change (must_change_password)
-    # before it can be used.
-    $envFile = Join-Path $Dist ".env"
-    if (Test-Path $envFile) { return }
-    New-Item -ItemType Directory -Path $envFile.Substring(0, $envFile.LastIndexOf("\")) -Force | Out-Null
-    $adminKey = "baraq-admin-" + ([System.Guid]::NewGuid().ToString("N").Substring(0, 20))
-    $analystKey = "baraq-analyst-" + ([System.Guid]::NewGuid().ToString("N").Substring(0, 20))
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $bytes = New-Object byte[] 32
-    $rng.GetBytes($bytes)
-    $secret = [System.BitConverter]::ToString($bytes).Replace("-", "")
-    $pass = "baraqadmin"
-    @(
-        "BARAQ_ADMIN_PASSWORD=$pass",
-        "BARAQ_API_KEYS=""{""$adminKey"":""admin"",""$analystKey"":""analyst""}""",
-        "BARAQ_TOKEN_SECRET=$secret"
-    ) | ForEach-Object { $_.ToString() } | Set-Content -Path $envFile -Encoding UTF8
-    # Strip the UTF-8 BOM that PS5 Set-Content -Encoding UTF8 adds (the seed
-    # loader must see clean keys).
-    $bytes = [System.IO.File]::ReadAllBytes($envFile)
-    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-        [System.IO.File]::WriteAllBytes($envFile, $bytes[3..($bytes.Length-1)])
-    }
-    Write-Host "  seed written to dist\.env (default password baraqadmin; change forced on first login)"
-}
-
 Ensure-PyInstaller
-New-SeedEnv
 
 if (-not $SkipFrontend) { Step "frontend"; Build-Frontend }
 
