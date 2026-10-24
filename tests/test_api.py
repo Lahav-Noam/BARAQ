@@ -35,7 +35,13 @@ def test_root(client):
 
 
 def test_health(client):
-    assert client.get("/api/health").json()["status"] == "ok"
+    resp = client.get("/api/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    # A fresh test database has no trained ML model, so the readiness endpoint
+    # legitimately reports "warning" while still being usable.
+    assert data["status"] in {"ok", "warning"}
+    assert data["checks"]["database"]["status"] == "ok"
 
 
 def test_dashboard_summary(client):

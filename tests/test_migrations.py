@@ -17,7 +17,9 @@ if not ADMIN_URL:
         "BARAQ_TEST_DATABASE_URL",
         "postgresql+psycopg://postgres:password@127.0.0.1:55432/baraq_test",
     )
-    ADMIN_URL = str(make_url(_test_url).set(database="postgres"))
+    ADMIN_URL = make_url(_test_url).set(database="postgres").render_as_string(
+        hide_password=False
+    )
 
 
 def _fresh_db_name() -> str:
@@ -32,7 +34,9 @@ def scratch_db():
     with admin.connect() as conn:
         conn.execute(text(f'CREATE DATABASE "{name}"'))
     admin.dispose()
-    url = str(make_url(ADMIN_URL).set(database=name))
+    # ``str(URL)`` masks the password as ``***``; the subprocess needs the real
+    # DSN to connect to the scratch database.
+    url = make_url(ADMIN_URL).set(database=name).render_as_string(hide_password=False)
     yield url, name
     admin = create_engine(ADMIN_URL, isolation_level="AUTOCOMMIT")
     with admin.connect() as conn:
