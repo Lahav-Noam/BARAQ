@@ -140,8 +140,11 @@ Procedure and restore drill: `documentation/backup_restore.md`.
 
 ## 3. First-run security checklist
 
-1. **Change the admin password** â€” the production gate refuses the
-   well-known `baraqadmin` bootstrap value on boot (`BARAQ_ENV=production`).
+1. **Change the admin password** - open `first_run_credentials.txt` next to
+   the executable, log in as `admin`, and change it immediately. The file is
+   deleted after the change. Installs that still use the retired shared
+   `baraqadmin` value are marked `must_change_password` on startup and rotate
+   it automatically.
 2. **Enroll admin TOTP 2FA** â€” with `BARAQ_ENFORCE_ADMIN_MFA=1` (production
    default), admin API features stay locked until every admin has a TOTP
    second factor (Account > Security in the console).
