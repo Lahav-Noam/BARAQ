@@ -68,6 +68,8 @@ certs/
 secrets.dat
 secrets.key
 secrets.tmp
+# One-time bootstrap password written next to the executable; never commit.
+first_run_credentials.txt
 
 # Per-host agent configs / keys (generated; never commit real keys)
 agent_configs/*.json
