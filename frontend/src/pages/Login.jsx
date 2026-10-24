@@ -371,7 +371,8 @@ export default function Login() {
 
           {mode === "login" && (
             <p className="text-center text-[11px] text-slate-600">
-              Default account: <span className="font-mono text-slate-500">admin / baraqadmin</span>
+              First run? The bootstrap password is in{" "}
+              <span className="font-mono text-slate-500">first_run_credentials.txt</span>
             </p>
           )}
         </form>
