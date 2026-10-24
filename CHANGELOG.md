@@ -37,6 +37,30 @@ capabilities.
   analyst-facing screens, because the frontend calls them with no role check.
   No behaviour changed in this release.
 
+### Security
+
+- **Release builds no longer embed a shared bootstrap credential.**
+  `scripts/build_release.ps1` and both PyInstaller specs stopped bundling
+  `dist/.env`; each installation generates a random admin password, API keys
+  and token secret, writes a one-time `first_run_credentials.txt` beside the
+  executable (mode 0600; ACL-restricted on Windows), and deletes it after the
+  first password change. Installs still carrying the retired `baraqadmin`
+  hash are rotated and forced through a password change on startup.
+- **Telemetry endpoints are tenant-scoped.** `/api/processes`, `/api/network`,
+  `/api/dns`, `/api/http` and `/api/network/stats` filtered only by limit; an
+  analyst could read every organization's raw process, network, DNS and HTTP
+  records.
+- **ML explanation endpoints no longer leak existence across orgs.**
+  `/api/system/ml/explain/alert/{id}` and `/event/{id}` now return 404 for IDs
+  outside the caller's organization instead of explaining another tenant's
+  data.
+- **The test suite refuses to run against a non-test database.**
+  `conftest.py` validates the configured database name before truncating and
+  re-checks `current_database()` before the destructive `TRUNCATE`.
+- **The database engine honours the vault-aware URL.** `connection.py` used
+  `settings.database_url` and ignored a `BARAQ_DATABASE_URL` stored only in
+  the DPAPI/AES vault; it now uses `backend.config.DATABASE_URL`.
+
 ---
 
 ## [1.0.8] — 2026-09-27 — "Production readiness hardening"
