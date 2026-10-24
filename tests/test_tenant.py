@@ -7,6 +7,8 @@ organization configured for the reporting agent.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -14,7 +16,16 @@ from sqlalchemy import func, select
 from backend.api.system import run_pipeline
 from backend.auth import create_token, hash_password
 from backend.database.connection import SessionLocal
-from backend.database.models import Alert, Endpoint, NormalizedEvent, User
+from backend.database.models import (
+    Alert,
+    DnsQuery,
+    Endpoint,
+    HttpRequest,
+    NetworkConnection,
+    NormalizedEvent,
+    ProcessRecord,
+    User,
+)
 from tests.fixtures import brute_force
 
 # ---------------------------------------------------------------------------
@@ -215,6 +226,95 @@ def test_endpoints_are_scoped_per_org(seeded, db, admin_client):
     assert resp.status_code == 200
     ids = [ep["agent_id"] for ep in resp.json()["items"]]
     assert "ep-a" in ids and "ep-b" not in ids
+
+
+def test_telemetry_endpoints_are_scoped_per_org(seeded, db, admin_client):
+    """Raw process/network/DNS/HTTP feeds must honour the caller's org."""
+    now = datetime.now(UTC)
+    with SessionLocal() as s:
+        s.add_all(
+            [
+                ProcessRecord(pid=101, name="proc-a", observed_at=now, org="univ-a"),
+                ProcessRecord(pid=202, name="proc-b", observed_at=now, org="univ-b"),
+                NetworkConnection(
+                    remote_ip="10.10.0.1",
+                    remote_port=443,
+                    observed_at=now,
+                    org="univ-a",
+                ),
+                NetworkConnection(
+                    remote_ip="10.10.0.2",
+                    remote_port=443,
+                    observed_at=now,
+                    org="univ-b",
+                ),
+                DnsQuery(query="a.telemetry.test", observed_at=now, org="univ-a"),
+                DnsQuery(query="b.telemetry.test", observed_at=now, org="univ-b"),
+                HttpRequest(
+                    host="a.telemetry.test",
+                    url="http://a.telemetry.test/",
+                    observed_at=now,
+                    org="univ-a",
+                ),
+                HttpRequest(
+                    host="b.telemetry.test",
+                    url="http://b.telemetry.test/",
+                    observed_at=now,
+                    org="univ-b",
+                ),
+            ]
+        )
+        s.commit()
+
+    analyst_a = _make_user(db, "telemetry-analyst", org="univ-a")
+    headers = _headers(analyst_a)
+
+    processes = admin_client.get("/api/processes", headers=headers)
+    assert processes.status_code == 200, processes.text
+    assert {p["name"] for p in processes.json()["items"]} == {"proc-a"}
+
+    network = admin_client.get("/api/network", headers=headers)
+    assert network.status_code == 200, network.text
+    assert {r["remote_ip"] for r in network.json()["items"]} == {"10.10.0.1"}
+
+    dns = admin_client.get("/api/dns", headers=headers)
+    assert dns.status_code == 200, dns.text
+    assert {r["query"] for r in dns.json()["items"]} == {"a.telemetry.test"}
+
+    http = admin_client.get("/api/http", headers=headers)
+    assert http.status_code == 200, http.text
+    assert {r["host"] for r in http.json()["items"]} == {"a.telemetry.test"}
+
+    stats = admin_client.get("/api/network/stats", headers=headers)
+    assert stats.status_code == 200, stats.text
+    body = stats.json()
+    assert body["counts"] == {"connections": 1, "dns": 1, "http": 1}
+    assert [r["ip"] for r in body["top_ips"]] == ["10.10.0.1"]
+    assert {r["query"] for r in body["top_dns"]} == {"a.telemetry.test"}
+    assert {r["host"] for r in body["top_hosts"]} == {"a.telemetry.test"}
+
+
+def test_ml_explanations_are_404_across_orgs(seeded, db, admin_client):
+    org_a_alert = db.scalar(select(Alert).where(Alert.org == "univ-a"))
+    org_a_event = db.scalar(
+        select(NormalizedEvent).where(NormalizedEvent.org == "univ-a")
+    )
+    assert org_a_alert is not None and org_a_event is not None
+
+    analyst_b = _make_user(db, "explain-analyst", org="univ-b")
+    headers = _headers(analyst_b)
+
+    alert_resp = admin_client.get(
+        f"/api/system/ml/explain/alert/{org_a_alert.id}", headers=headers
+    )
+    assert alert_resp.status_code == 404
+    assert alert_resp.json()["detail"] == "Alert not found"
+
+    event_resp = admin_client.get(
+        f"/api/system/ml/explain/event/{org_a_event.id}", headers=headers
+    )
+    assert event_resp.status_code == 404
+    assert event_resp.json()["detail"] == "Event not found"
 
 
 def test_admin_can_narrow_scope_via_header(seeded, admin_client):
