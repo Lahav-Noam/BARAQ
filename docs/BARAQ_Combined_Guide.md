@@ -166,16 +166,24 @@ On first run it creates `venv`, installs requirements, and — if `frontend/dist
 
 ### 4.3 First-run credentials
 
-On the very first start, BARAQ generates random credentials and prints them exactly once:
+On the very first start, BARAQ generates random credentials, prints a masked
+summary exactly once, and writes the full values to
+`first_run_credentials.txt` next to the executable (mode 0600; ACL-restricted
+to the current user on Windows):
 
 ```
 BARAQ first-run setup complete
-  Dashboard login : admin / <random-password>
+  Dashboard login : admin / <masked-password>
+  Full credentials: first_run_credentials.txt
   Admin API key   : baraq-admin-<random>
   Analyst API key : baraq-analyst-<random>
 ```
 
-They are stored DPAPI-encrypted in `secrets.dat` (never plaintext on disk). If you lost them, an admin can reset via `users` page → Edit → Reset password, and API keys are managed in the security / vault documentation.
+The password and API keys are also stored DPAPI-encrypted in `secrets.dat`
+(never plaintext on disk). The console forces a password change on first
+login and deletes `first_run_credentials.txt` once it succeeds. If you lost
+the credentials, an admin can reset via the `users` page → Edit → Reset
+password, and API keys are managed in the security / vault documentation.
 
 ### 4.4 Verify installation
 
@@ -222,7 +230,7 @@ All tunables live in **`backend/config.py`**, overridable via environment variab
 | `BARAQ_OIDC_ENABLED` / ISSUER / CLIENT… | off | OpenID SSO config |
 | `BARAQ_ELASTICSEARCH_URL` / `INDEX` | empty | Elasticsearch forwarding |
 
-**Deprecated/developer:** the login page hints at the default creds; after first-run the real password is the vault-generated one.
+**Deprecated/developer:** the login page no longer hints at a default password. Read the generated credential from `first_run_credentials.txt` (or `secrets.dat`); installs still using the retired `baraqadmin` hash are rotated automatically on startup.
 
 ### 5.2 Thresholds tunable in config.py
 
@@ -478,7 +486,7 @@ Interactive docs: **`http://127.0.0.1:8001/docs`** (Swagger UI) ; openapi at `/o
 |---|---|
 | Blank / black page after startup update | Stale `index.html` cached hydrating -> hard refresh (Ctrl+Shift+R); the backend now serves index with `no-store` and assets immutable |
 | Dashboard shows “Backend Offline” | WS not connected yet; check socket connect -> scheduler running; see `BARAQ_SCHEDULER_ENABLED`; if you disabled the scheduler you won’t get live data |
-| Login says "wrong credentials" even after admin setup | Use the first-run generated password from `secrets.dat` (console output on first boot), or reset the user in the DB / `Users & Audit` UI |
+| Login says "wrong credentials" even after admin setup | Use the generated password from `first_run_credentials.txt` (or `secrets.dat`), or reset the user in the DB / `Users & Audit` UI |
 | API key rejected (401) | Set `BARAQ_ALLOW_DEV_KEYS=0` path: must configure `BARAQ_API_KEYS` first; otherwise provide the correct `X-API-Key` |
 | Server fails to start: port already in use | Another instance running; only one uvicorn keeps itself bound |
 | `[Errno 10048]` bind error | Duplicate uvicorn; close the other console or kill the process holding :8001/:8443 |
