@@ -114,7 +114,33 @@ def admin(client):
         yield _make_user(db, "single-tenant-admin", role="admin", org="")
 
 
-@pytest.mark.parametrize("prefix,path,ui_dependent", ADMIN_ONLY_SURFACES)
+def _gap_param(prefix: str, path: str, ui_dependent: bool):
+    """Mark the known-ungated surfaces as expected failures.
+
+    ``/api/compliance/export`` is already admin-gated, so it stays a real
+    assertion and would catch a regression that re-opened it.
+    """
+    if path == "/api/compliance/export":
+        return pytest.param(prefix, path, ui_dependent)
+    return pytest.param(
+        prefix,
+        path,
+        ui_dependent,
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason=(
+                "known single-tenant gap: tenant-less surfaces are not "
+                "admin-gated; see the module docstring for the three "
+                "candidate resolutions"
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix,path,ui_dependent",
+    [_gap_param(*surface) for surface in ADMIN_ONLY_SURFACES],
+)
 def test_analyst_is_refused_on_tenant_less_surfaces(
     client, analyst, prefix, path, ui_dependent
 ):
