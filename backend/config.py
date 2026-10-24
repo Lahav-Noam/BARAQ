@@ -76,8 +76,9 @@ DEFAULT_ADMIN_PASSWORD = _secrets.token_urlsafe(16)
 #: Retired well-known bootstrap password. Release builds before 1.0.9 bundled
 #: this value into a shared ``dist/.env`` seed; it is detected and rotated on
 #: startup so an upgraded install cannot keep a credential that every other
-#: copy of the same build also knows.
-INSECURE_BOOTSTRAP_PASSWORD = "baraqadmin"
+#: copy of the same build also knows. This is a public legacy default, not a
+#: live secret.
+INSECURE_BOOTSTRAP_PASSWORD = "baraqadmin"  # ggignore
 
 #: One-time credential handoff for windowed/packaged installs, written next to
 #: the executable when random credentials are generated. Deleted as soon as
@@ -172,8 +173,8 @@ def _migrate_env_secrets_to_vault(vault, env_path: Path) -> None:
 def _strip_env_first_run_vars(env_path: Path) -> None:
     """Remove bootstrap credential lines from .env before regenerating them.
 
-    ``_load_dotenv`` is non-overriding, so leaving an old ``baraqadmin`` line
-    in place would make the next process start regenerate credentials again.
+    ``_load_dotenv`` is non-overriding, so leaving an old bootstrap line in
+    place would make the next process start regenerate credentials again.
     """
     try:
         lines = env_path.read_text(encoding="utf-8").splitlines()
@@ -336,7 +337,7 @@ def _ensure_secure_secrets(env_path: Path = ENV_PATH) -> None:
     }
 
     # Remove old bootstrap lines before persisting replacements: _load_dotenv
-    # is non-overriding, so a stale ``baraqadmin`` line would otherwise be
+    # is non-overriding, so a stale bootstrap line would otherwise be
     # re-read on the next start and trigger another rotation.
     _strip_env_first_run_vars(env_path)
 
@@ -367,7 +368,7 @@ def _ensure_secure_secrets(env_path: Path = ENV_PATH) -> None:
         logger.warning(
             "Rotated the retired shared bootstrap credentials (admin password, "
             "API keys and token secret): BARAQ_ADMIN_PASSWORD was the "
-            "well-known 'baraqadmin' value."
+            "well-known retired bootstrap value."
         )
 
     username = os.environ.get("BARAQ_ADMIN_USERNAME", "admin")

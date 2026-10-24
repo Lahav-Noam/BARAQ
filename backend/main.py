@@ -109,7 +109,7 @@ if config._USING_DEV_KEYS and config.ALLOW_DEV_KEYS:
 
 
 def _rotate_legacy_bootstrap_password(user) -> bool:
-    """Replace a retired shared ``baraqadmin`` hash with the per-install one.
+    """Replace a retired shared bootstrap hash with the per-install one.
 
     Returns True when the row was legacy and has been rewritten. The caller
     owns the transaction commit. ``ADMIN_PASSWORD`` is the value ``config``
@@ -137,7 +137,7 @@ def _seed_admin_user() -> None:
         existing = db.scalar(select(User).where(User.username == ADMIN_USERNAME))
         if existing:
             # Upgraded deployments may still carry the retired shared
-            # "baraqadmin" hash from a bundled release seed. Rotate it to the
+            # shared bootstrap hash from a bundled release seed. Rotate it to the
             # per-install password and force a change before the rest of the
             # API unlocks. The test profile deliberately seeds that value in
             # fixtures, so leave it alone there.

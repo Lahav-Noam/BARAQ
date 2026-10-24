@@ -1,7 +1,7 @@
 """Regression tests for the random first-run bootstrap credential lifecycle.
 
 Release builds used to embed a shared ``dist/.env`` seed with the well-known
-``baraqadmin`` password. These tests pin the replacement behaviour: generate
+shared bootstrap password. These tests pin the replacement behaviour: generate
 per-install credentials, expose them once through a 0600 handoff file, and
 rotate any install that still carries the retired shared password.
 """
@@ -98,7 +98,7 @@ def test_retired_shared_password_is_rotated(monkeypatch, tmp_path):
     credentials = _patch_config(monkeypatch, tmp_path, vault)
     env_path = tmp_path / ".env"
     env_path.write_text(
-        "BARAQ_ADMIN_PASSWORD=baraqadmin\n"
+        f"BARAQ_ADMIN_PASSWORD={config.INSECURE_BOOTSTRAP_PASSWORD}\n"
         'BARAQ_API_KEYS={"old-admin-key": "admin"}\n'
         "BARAQ_TOKEN_SECRET=old-token-secret\n"
         "BARAQ_KEEP_ME=1\n",
