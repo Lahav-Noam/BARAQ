@@ -23,7 +23,7 @@ from backend.config import (
 )
 from backend.database.connection import get_db
 from backend.ml.anomaly import get_detector
-from backend.security import require_admin, require_auth
+from backend.security import require_admin, require_auth, tenant_scope
 
 logger = logging.getLogger("baraq.api.system")
 router = APIRouter(
@@ -707,11 +707,14 @@ def ml_drift(hours: int = Query(12, ge=1, le=168), db: Session = Depends(get_db)
 
 
 @router.get("/ml/explain/alert/{alert_id}")
-def ml_explain_alert(alert_id: int, db: Session = Depends(get_db)):
+def ml_explain_alert(
+    alert_id: int, request: Request, db: Session = Depends(get_db)
+):
     """Per-evidence-event ML explanations (SHAP/LIME) for an alert.
 
     Computed under a hard wall-clock budget; slow explainers degrade to a
     permutation fallback so the endpoint never blocks the analyst for long.
+    Tenant-scoped: a cross-org alert ID is reported as missing.
     """
     from sqlalchemy.orm import selectinload
 
@@ -721,23 +724,27 @@ def ml_explain_alert(alert_id: int, db: Session = Depends(get_db)):
     alert = db.get(
         Alert, alert_id, options=[selectinload(Alert.events).selectinload("*")]
     )
-    if not alert:
-        from fastapi import HTTPException
-
+    scope = tenant_scope(request)
+    if not alert or (scope is not None and alert.org != scope):
         raise HTTPException(404, "Alert not found")
     return {"alert_id": alert_id, "explanations": explain_alert(db, alert)}
 
 
 @router.get("/ml/explain/event/{event_id}")
-def ml_explain_event(event_id: int, db: Session = Depends(get_db)):
-    """Explain a single normalised event's anomaly score."""
+def ml_explain_event(
+    event_id: int, request: Request, db: Session = Depends(get_db)
+):
+    """Explain a single normalised event's anomaly score.
+
+    Tenant-scoped: a cross-org event ID is reported as missing so callers
+    cannot enumerate another organization's telemetry.
+    """
     from backend.database.models import NormalizedEvent
     from backend.ml.explain import explain_event
 
     event = db.get(NormalizedEvent, event_id)
-    if not event:
-        from fastapi import HTTPException
-
+    scope = tenant_scope(request)
+    if not event or (scope is not None and event.org != scope):
         raise HTTPException(404, "Event not found")
     return explain_event(event, session=db)
 
