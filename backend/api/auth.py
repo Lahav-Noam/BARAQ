@@ -47,7 +47,12 @@ from backend.auth import (
     verify_refresh_token,
     verify_token,
 )
-from backend.config import AUTH_TOKEN_SECRET, COOKIE_SECURE, DEFAULT_ADMIN_PASSWORD
+from backend.config import (
+    AUTH_TOKEN_SECRET,
+    COOKIE_SECURE,
+    DEFAULT_ADMIN_PASSWORD,
+    clear_first_run_credentials,
+)
 from backend.database.connection import get_db
 from backend.database.models import AuditLog, User
 from backend.security import (
@@ -1004,6 +1009,9 @@ def change_password(
     user.password_changed_at = datetime.now(UTC)
     revoke_all_sessions(user, reason="password_changed")
     db.commit()
+    # The bootstrap handoff file contains the now-replaced password; remove it
+    # so a plaintext credential does not outlive the first login.
+    clear_first_run_credentials()
     log_action(
         db,
         user.username,
@@ -1076,6 +1084,9 @@ def update_user(
     if sensitive_change:
         revoke_all_sessions(user, reason="admin_update")
     db.commit()
+    if body.password:
+        # An admin reset replaces the bootstrap password in the handoff file.
+        clear_first_run_credentials()
     log_action(
         db,
         _actor(request),
