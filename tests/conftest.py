@@ -13,11 +13,20 @@ from __future__ import annotations
 
 import os
 import tempfile
+import urllib.parse
 
 _test_database_url = os.environ.get("BARAQ_TEST_DATABASE_URL") or os.environ.get(
     "BARAQ_DATABASE_URL",
     "postgresql+psycopg://postgres:password@127.0.0.1:55432/baraq_test",
 )
+_test_db_name = urllib.parse.urlsplit(_test_database_url).path.lstrip("/")
+if not _test_db_name or "test" not in _test_db_name.lower():
+    raise RuntimeError(
+        "Refusing to run the test suite against database "
+        f"{_test_db_name!r}: the suite truncates every table. Set "
+        "BARAQ_TEST_DATABASE_URL to a dedicated database whose name contains "
+        "'test' (for example baraq_test)."
+    )
 os.environ["BARAQ_TEST_DATABASE_URL"] = _test_database_url
 os.environ["BARAQ_DATABASE_URL"] = _test_database_url
 print(f"[conftest] test DB URL -> {os.environ['BARAQ_DATABASE_URL']}")
@@ -140,6 +149,18 @@ def _reset_database(terminate_stragglers: bool = False):
     session = SessionLocal()
     try:
         session.execute(text("SET LOCAL lock_timeout = '10s'"))
+        # Defense in depth: conftest validates BARAQ_TEST_DATABASE_URL at
+        # import, but re-check the database we are actually connected to
+        # before issuing a destructive TRUNCATE. The catalog lookup is
+        # PostgreSQL-specific; SQLite installs are covered by the URL guard.
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            db_name = session.scalar(text("SELECT current_database()")) or ""
+            if "test" not in str(db_name).lower():
+                raise RuntimeError(
+                    f"Refusing to truncate non-test database {db_name!r}. "
+                    "Set BARAQ_TEST_DATABASE_URL to a dedicated test database."
+                )
         if terminate_stragglers:
             session.execute(
                 text(
