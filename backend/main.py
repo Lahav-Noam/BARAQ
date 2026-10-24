@@ -70,6 +70,7 @@ from backend.config import (
     CORS_ORIGINS,
     DEFAULT_ADMIN_PASSWORD,
     HSTS_MAX_AGE,
+    INSECURE_BOOTSTRAP_PASSWORD,
     IS_PRODUCTION,
     METRICS_PUBLIC,
     SECURITY_HEADERS,
@@ -107,6 +108,23 @@ if config._USING_DEV_KEYS and config.ALLOW_DEV_KEYS:
     )
 
 
+def _rotate_legacy_bootstrap_password(user) -> bool:
+    """Replace a retired shared ``baraqadmin`` hash with the per-install one.
+
+    Returns True when the row was legacy and has been rewritten. The caller
+    owns the transaction commit. ``ADMIN_PASSWORD`` is the value ``config``
+    generated (or adopted) for this start, so the credential written to
+    ``first_run_credentials.txt`` becomes the working bootstrap password.
+    """
+    from backend.auth import hash_password, verify_password
+
+    if not verify_password(INSECURE_BOOTSTRAP_PASSWORD, user.password_hash):
+        return False
+    user.password_hash = hash_password(ADMIN_PASSWORD)
+    user.must_change_password = True
+    return True
+
+
 def _seed_admin_user() -> None:
     """Create the bootstrap admin account if the users table is empty."""
     from sqlalchemy import select
@@ -118,20 +136,38 @@ def _seed_admin_user() -> None:
     try:
         existing = db.scalar(select(User).where(User.username == ADMIN_USERNAME))
         if existing:
+            # Upgraded deployments may still carry the retired shared
+            # "baraqadmin" hash from a bundled release seed. Rotate it to the
+            # per-install password and force a change before the rest of the
+            # API unlocks. The test profile deliberately seeds that value in
+            # fixtures, so leave it alone there.
+            if BARAQ_ENV != "test" and _rotate_legacy_bootstrap_password(existing):
+                db.commit()
+                logger.warning(
+                    "Admin user '%s' still used the retired shared bootstrap "
+                    "password; rotated it to the newly generated credential "
+                    "and a password change is required before the console "
+                    "unlocks.",
+                    ADMIN_USERNAME,
+                )
             return
+        must_change_password = ADMIN_PASSWORD in (
+            DEFAULT_ADMIN_PASSWORD,
+            INSECURE_BOOTSTRAP_PASSWORD,
+        )
         admin = User(
             username=ADMIN_USERNAME,
             password_hash=hash_password(ADMIN_PASSWORD),
             role="admin",
             full_name="BARAQ Administrator",
             is_active=True,
-            must_change_password=ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD,
+            must_change_password=must_change_password,
         )
         db.add(admin)
         db.commit()
         logger.info("Seeded bootstrap admin user '%s'", ADMIN_USERNAME)
         logger.debug("Admin user '%s' created with role='admin', must_change_password=%s",
-                      ADMIN_USERNAME, ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD)
+                      ADMIN_USERNAME, must_change_password)
     except Exception:
         db.rollback()
         raise
