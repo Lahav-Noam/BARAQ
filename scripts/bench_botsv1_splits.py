@@ -59,6 +59,34 @@ def split_s1(meta, seed=42):
     _local_time_split(meta, sp)
     return sp
 
+def split_s4(meta, train_end='2016-08-24 16:50', val_end='2016-08-24 17:15'):
+    """Strict time-forward holdout across Campaign B's three bursts.
+
+    Campaign B is not one continuous burst: it has bursts at 16:49, 16:50, and
+    17:15.  S1 splits destination IPs randomly within those bursts, so train
+    and test are interleaved in time and share the source host and port.  S4
+    instead trains on the first burst, validates on the second, and tests on
+    the final burst plus all later background.  Features remain causal because
+    ``_load_network_features`` walks events in timestamp order.
+
+    This is still a known-infrastructure test: the later bursts reuse the same
+    destination IP list and port.  It is useful for measuring temporal
+    consistency, not cross-campaign generalization (see S2/S3 for that).
+    """
+    sp = np.full(len(meta), '', dtype=object)
+    ts = pd.to_datetime(meta.ts, utc=True)
+    bots = (meta.dataset == 'botsv1').to_numpy()
+    start = pd.Timestamp(train_end, tz='UTC')
+    end = pd.Timestamp(val_end, tz='UTC')
+    sp[bots & (ts < start).to_numpy()] = 'train'
+    sp[bots & (ts >= start).to_numpy() & (ts < end).to_numpy()] = 'val'
+    sp[bots & (ts >= end).to_numpy()] = 'test'
+    _local_time_split(meta, sp)
+    if (sp == '').any():
+        raise ValueError(f'unassigned rows in S4: {int((sp == "").sum())}')
+    return sp
+
+
 def split_cross(meta, direction='A_to_B', seed=42):
     """Leave-one-campaign-out: train on one attack campaign, test on the other."""
     sp = np.full(len(meta), '', dtype=object)
@@ -96,6 +124,7 @@ def split_cross(meta, direction='A_to_B', seed=42):
 if __name__ == '__main__':
     meta = pd.read_pickle('datasets/botsv1_bench/meta.pkl')
     for name, sp in [('S1', split_s1(meta)),
+                     ('S4', split_s4(meta)),
                      ('S2_AtoB', split_cross(meta, 'A_to_B')),
                      ('S3_BtoA', split_cross(meta, 'B_to_A'))]:
         m = meta.copy(); m['split'] = sp

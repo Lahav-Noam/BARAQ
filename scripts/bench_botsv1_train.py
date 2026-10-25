@@ -20,7 +20,7 @@ ROOT = Path('datasets/botsv1_bench')
 RESULTS = ROOT / 'results'
 RESULTS.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, 'scripts')
-from bench_botsv1_splits import split_s1, split_cross
+from bench_botsv1_splits import split_s1, split_s4, split_cross
 from backend.ml.anomaly import MLAnomalyDetector
 
 def rank_scores(raw, baseline):
@@ -129,7 +129,7 @@ def build_train_indices(meta, train_a_dup=20, train_local_dup=10):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--scenario', default='S1', choices=['S1', 'S2', 'S3'])
+    ap.add_argument('--scenario', default='S1', choices=['S1', 'S4', 'S2', 'S3'])
     ap.add_argument('--tag', default='')
     ap.add_argument('--no-local-aug', action='store_true')
     ap.add_argument('--no-ti', action='store_true')
@@ -139,8 +139,12 @@ def main():
     d = np.load(ROOT / 'features.npz', allow_pickle=True)
     X = d['X']; meta = pd.read_pickle(ROOT / 'meta.pkl')
     y = (meta.label == 1).to_numpy().astype(int)
-    split = split_s1(meta) if args.scenario == 'S1' else split_cross(
-        meta, 'A_to_B' if args.scenario == 'S2' else 'B_to_A')
+    if args.scenario == 'S1':
+        split = split_s1(meta)
+    elif args.scenario == 'S4':
+        split = split_s4(meta)
+    else:
+        split = split_cross(meta, 'A_to_B' if args.scenario == 'S2' else 'B_to_A')
     meta = meta.copy(); meta['split'] = split
     tr = (meta.split == 'train').to_numpy(); va = (meta.split == 'val').to_numpy()
     te = (meta.split == 'test').to_numpy()
