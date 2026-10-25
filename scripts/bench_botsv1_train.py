@@ -3,9 +3,11 @@
 
 Scenarios
 ---------
-S1 : within-campaign holdout. Campaign B is held out by unseen destination IP;
-     campaign A is held out by future time. Benign background is held out by
-     time buckets; local live flows are held out by time.
+S1 : within-campaign shortcut diagnostic. Campaign B is held out by unseen
+     destination IP but still shares its host, port, and bursts. Treat this as
+     a diagnostic, not a generalization gate.
+S4 : time-forward burst holdout. Train on the 16:49 Campaign B burst, validate
+     on the 16:50 burst, and test on the 17:15 burst plus later background.
 S2 : leave-one-campaign-out A -> B (train on campaign A, test on campaign B).
 S3 : leave-one-campaign-out B -> A (train on campaign B, test on campaign A).
 """
