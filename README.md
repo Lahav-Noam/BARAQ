@@ -40,6 +40,11 @@ Read this section first — it is the difference between a demo and a SOC.
 - **Response actions are simulated** while
   `BARAQ_SOAR_DESTRUCTIVE_ACTIONS_ENABLED=0` (the default). Containment
   playbooks ship disabled. A `block_ip` has no TTL — undo it with `unblock_ip`.
+- **ML is advisory, not an autonomous blocker.** The loaded v121 bundle has no
+  campaign-held-out validation and is shadow/advisory only. Score monitoring is
+  exposed at `/api/system/ml/deployment`; the promotion gate and rollout
+  procedure are in
+  [`docs/ml-deployment-readiness.md`](docs/ml-deployment-readiness.md).
 - The cutover procedure, go/no-go gates and rollback triggers are in
   [`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md). The full record of the
   2026-09 hardening pass, including known issues, is in
@@ -215,6 +220,8 @@ BARAQ auto-generates OpenAPI documentation:
 | [`docs/user-guide.md`](docs/user-guide.md) | Complete operator guide |
 | [`docs/architecture.md`](docs/architecture.md) | System architecture and data flow |
 | [`docs/ml_strategy_and_validation.md`](docs/ml_strategy_and_validation.md) | ML training and validation |
+| [`docs/ml-deployment-readiness.md`](docs/ml-deployment-readiness.md) | ML shadow-mode contract, promotion gate, monitoring, rollback |
+| [`docs/botsv1-ml-benchmark.md`](docs/botsv1-ml-benchmark.md) | BOTSv1 benchmark and retracted S1/context results |
 | [`docs/deployment.md`](docs/deployment.md) | Fleet deployment guide |
 | [`docs/dataset-import.md`](docs/dataset-import.md) | External dataset import guide |
 | [`docs/ml-training.md`](docs/ml-training.md) | ML training configuration |

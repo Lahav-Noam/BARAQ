@@ -579,6 +579,50 @@ class NetworkConnection(Base):
         }
 
 
+class MLShadowScore(Base):
+    """A model score recorded for deployment monitoring, not enforcement.
+
+    The ML layer is advisory.  This table records the score and operating
+    threshold for each scored entity (currently one network bucket per remote
+    IP) so operators can inspect score distributions, estimate local false
+    positives, and compare a candidate model before it is promoted.  No alert
+    or response action is created from this row.
+    """
+
+    __tablename__ = "ml_shadow_scores"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    stream: Mapped[str] = mapped_column(String(32), default="network", index=True)
+    model_version: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    feature_version: Mapped[int] = mapped_column(Integer, default=0)
+    entity: Mapped[str] = mapped_column(String(256), default="", index=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    threshold: Mapped[float] = mapped_column(Float, default=0.5)
+    flagged: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    org: Mapped[str] = mapped_column(String(64), default="", index=True)
+    demo: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    detail: Mapped[dict] = mapped_column(JSONColumnType, default=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "stream": self.stream,
+            "model_version": self.model_version,
+            "feature_version": self.feature_version,
+            "entity": self.entity,
+            "score": self.score,
+            "threshold": self.threshold,
+            "flagged": self.flagged,
+            "observed_at": self.observed_at.isoformat() if self.observed_at else None,
+            "org": self.org,
+            "demo": self.demo,
+            "detail": self.detail or {},
+        }
+
+
 class DnsQuery(Base):
     """A DNS query observed by the DNS monitor (Sysmon Event 22 / snoop).
 

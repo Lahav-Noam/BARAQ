@@ -58,10 +58,12 @@ from backend.config import (
 )
 from backend.database.connection import SessionLocal
 from backend.database.models import (
+    MLShadowScore,
     NetworkConnection,
     NormalizedEvent,
     Verdict,
 )
+from backend.ml.deployment import configured_mode
 
 logger = logging.getLogger("baraq.ml")
 
@@ -5150,12 +5152,19 @@ class MLAnomalyDetector:
         if not self.is_ready:
             return {"status": "not-ready"}
 
+        mode = configured_mode()
+        if mode == "off":
+            return {"status": "disabled", "mode": mode, "scored": 0, "flagged": 0}
+
         close = session is None
         session = session or SessionLocal()
         try:
             since = datetime.now(UTC) - timedelta(hours=hours)
             flagged = 0
             scored = 0
+            shadow_scored = 0
+            shadow_flagged = 0
+            network_threshold = float(self.thresholds.get("network", 0.5))
             # Pass-scoped cache: window aggregates (counts, baselines,
             # entropies) are identical for every event in this window, so
             # they are computed once instead of once per event.
@@ -5192,11 +5201,12 @@ class MLAnomalyDetector:
                     except Exception:
                         logger.exception("Unexpected error")
                         continue
-                    ev.ml_score = round(score, 4)
                     scored += 1
-                    if score > self.thresholds.get(behavior, 0.5):
-                        ev.is_anomaly = True
-                        flagged += 1
+                    if mode != "shadow":
+                        ev.ml_score = round(score, 4)
+                        if score > self.thresholds.get(behavior, 0.5):
+                            ev.is_anomaly = True
+                            flagged += 1
                     # Feed the live event to the online learner: the reservoir
                     # buffer learns the normal behavior of each stream and the
                     # active-learning queue picks up uncertain events. The
@@ -5231,6 +5241,7 @@ class MLAnomalyDetector:
                         func.sum(NetworkConnection.bytes_sent),
                         func.sum(NetworkConnection.bytes_recv),
                         func.avg(NetworkConnection.duration_seconds),
+                        func.max(NetworkConnection.org),
                     )
                     .where(NetworkConnection.observed_at >= since)
                     .group_by(NetworkConnection.remote_ip)
@@ -5240,6 +5251,7 @@ class MLAnomalyDetector:
                         remote_ip or "unknown",
                         int(count),
                         int(distinct_ports),
+                        str(org or ""),
                     )
                     for (
                         remote_ip,
@@ -5248,11 +5260,12 @@ class MLAnomalyDetector:
                         _bytes_sent,
                         _bytes_recv,
                         _duration,
+                        org,
                     ) in net_rows
                 ]
                 net_feats = [
                     self._network_features(ip, count, ports)
-                    for ip, count, ports in net_inputs
+                    for ip, count, ports, _org in net_inputs
                 ]
                 try:
                     net_scores = self._combined_score_batch(
@@ -5267,7 +5280,9 @@ class MLAnomalyDetector:
                     self.online_learner is not None
                     and self.online_learner.take_network_pass()
                 )
-                for (_ip, _cnt, _ports), combined, nfeat in zip(
+                shadow_now = datetime.now(UTC)
+                model_version = int(getattr(self, "version", 0) or 0)
+                for (_ip, _cnt, _ports, _org), combined, nfeat in zip(
                     net_inputs, net_scores, net_feats
                 ):
                     try:
@@ -5276,7 +5291,35 @@ class MLAnomalyDetector:
                         logger.exception("Unexpected error")
                         continue
                     scored += 1
-                    if score > self.thresholds.get("network", 0.5):
+                    breached = score > network_threshold
+                    # Persist every network score for deployment monitoring.
+                    # This row is not an alert and is never consumed by an
+                    # automated response path.
+                    try:
+                        session.add(
+                            MLShadowScore(
+                                stream="network",
+                                model_version=model_version,
+                                feature_version=ML_FEATURE_VERSION,
+                                entity=str(_ip)[:256],
+                                score=round(float(score), 6),
+                                threshold=network_threshold,
+                                flagged=bool(breached),
+                                observed_at=shadow_now,
+                                org=_org,
+                                detail={
+                                    "count": _cnt,
+                                    "distinct_ports": _ports,
+                                    "mode": mode,
+                                },
+                            )
+                        )
+                        shadow_scored += 1
+                        if breached:
+                            shadow_flagged += 1
+                    except Exception:
+                        logger.debug("shadow score insert failed", exc_info=True)
+                    if mode != "shadow" and breached:
                         flagged += 1
                     if buffer_network:
                         try:
@@ -5298,7 +5341,15 @@ class MLAnomalyDetector:
                     logger.debug("online pass commit failed", exc_info=True)
 
             session.commit()
-            return {"status": "ok", "scored": scored, "flagged": flagged}
+            result = {
+                "status": "ok",
+                "mode": mode,
+                "scored": scored,
+                "flagged": flagged,
+                "shadow_scores": shadow_scored,
+                "shadow_flagged": shadow_flagged,
+            }
+            return result
         finally:
             if close:
                 session.close()

@@ -135,10 +135,12 @@ def main():
     ap.add_argument('--tag', default='')
     ap.add_argument('--no-local-aug', action='store_true')
     ap.add_argument('--no-ti', action='store_true')
+    ap.add_argument('--features', default='features.npz',
+                    help='feature matrix under datasets/botsv1_bench')
     ap.add_argument('--zero-cols', default='', help='comma-separated feature indices to zero')
     args = ap.parse_args()
 
-    d = np.load(ROOT / 'features.npz', allow_pickle=True)
+    d = np.load(ROOT / args.features, allow_pickle=True)
     X = d['X']; meta = pd.read_pickle(ROOT / 'meta.pkl')
     y = (meta.label == 1).to_numpy().astype(int)
     if args.scenario == 'S1':

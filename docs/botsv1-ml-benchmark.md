@@ -6,7 +6,10 @@ a within-campaign shortcut: Campaign B is separated by a single static feature
 (`dst_port == 6892`), and the S1 split leaves that feature, the source host, the
 same three DGA bursts, and the same destination-IP range in both training and
 test. **v122 was rolled back to v121.** The clean cross-campaign tests (S2/S3)
-show no transfer at a deployable local-false-positive budget.
+show no transfer at a deployable local-false-positive budget. A later
+context-feature S2 result was also **retracted** as a path/missing-value artifact
+(§8.7), so no candidate is promoted; the live deployment contract is
+[`docs/ml-deployment-readiness.md`](ml-deployment-readiness.md).
 
 This document keeps the original numbers as an audit trail, then explains why
 they cannot be used as the model's headline performance.
@@ -392,6 +395,37 @@ A future promotion should require all of the following:
 6. A local benign holdout with enough traffic to estimate the false-positive
    rate, not just a handful of flows.
 
+### 8.7 Context-feature audit (retracted)
+
+A later experiment added 48 causal process/destination-context features
+(`scripts/bench_botsv1_context_features.py`). On S2 it appeared to solve the
+cross-campaign failure:
+
+| S2 variant | Threshold | B recall | A late recall | Local FP | BOTSv1 background FP |
+|---|---:|---:|---:|---:|---:|
+| Full 77-feature context blend | 0.6553 | 48,197/48,199 | 84/84 | 1/1,040 | 14/109,254 |
+| Same model, path/image columns zeroed | 0.5994 | **1/48,199** | 84/84 | 0/1,040 | 0/109,254 |
+
+The gain is a **dataset artifact**, not a behavioral improvement:
+
+- Local rows in this benchmark have no process path (`image` is empty), while
+  BOTSv1 rows carry the full path. A path-presence feature therefore separates
+  local from BOTSv1 by construction.
+- A single feature, `image_entropy`, flags 48,197/48,199 B and 84/84 A at a
+  threshold selected for zero local false positives. `image_len` alone flags B
+  with zero A recall. These are Campaign-B path fingerprints.
+- Removing path/image shape columns collapses B recall to one event even though
+  process-destination history remains.
+- S3 is unaffected: B→A still detects **0/417** at a deployable threshold; at
+  the local-1% point it detects 4/417 while flagging 12,467 background rows.
+
+The context result is therefore **retracted for deployment and promotion**.
+The matrix and script are retained only as a reproducible negative result and
+as an example for the feature-artifact gate in
+[`docs/ml-deployment-readiness.md`](ml-deployment-readiness.md). They must not be
+used to justify a model promotion, and context features are not integrated into
+the runtime bundle.
+
 ## 9. Reproduce
 
 ```bash
@@ -427,6 +461,12 @@ export BARAQ_DATABASE_URL='postgresql+psycopg://postgres:postgres@127.0.0.1:5432
 
 # One-feature baselines and split-composition checks.
 .venv/bin/python scripts/bench_botsv1_diagnostics.py
+
+# Research-only context scan. The result is retracted in §8.7; do not use it
+# for a promotion decision.
+.venv/bin/python scripts/bench_botsv1_context_features.py
+.venv/bin/python scripts/bench_botsv1_train.py \
+  --scenario S2 --tag _ctx --features features_context.npz
 
 # Optional local-FPR analysis.
 .venv/bin/python scripts/bench_botsv1_analyze.py --scenario S1 --tag S1_v1

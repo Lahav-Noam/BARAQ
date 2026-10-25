@@ -758,6 +758,34 @@ ML_MODEL_BUNDLE = Path(
 #: catching distribution tails (constant-false-alarm-rate calibration).
 ML_TARGET_FPR = float(os.environ.get("BARAQ_ML_TARGET_FPR", "0.10"))
 
+#: Deployment mode for the ML layer.  The default is deliberately
+#: ``advisory``: event scores may influence analyst-facing risk, but the ML
+#: layer never triggers a response action on its own.  ``shadow`` stores
+#: candidate scores for monitoring without setting ``is_anomaly``/``ml_score``
+#: on events.  ``off`` disables scoring entirely.  There is intentionally no
+#: ``enforce`` mode until a model carries a validated campaign-held-out
+#: manifest (see docs/ml-deployment-readiness.md).
+ML_DEPLOYMENT_MODES = ("off", "shadow", "advisory")
+ML_DEPLOYMENT_MODE = os.environ.get("BARAQ_ML_DEPLOYMENT_MODE", "advisory").strip().lower()
+if ML_DEPLOYMENT_MODE not in ML_DEPLOYMENT_MODES:
+    # Fail closed to shadow rather than silently enabling an unknown mode.
+    ML_DEPLOYMENT_MODE = "shadow"
+
+#: Checksummed deployment manifest written by
+#: ``scripts/ml_deployment_gate.py``.  Missing manifest => no enforcement;
+#: an unreadable/blocked manifest downgrades scoring to shadow.
+ML_MANIFEST_FILE = Path(
+    os.environ.get(
+        "BARAQ_ML_MANIFEST_FILE",
+        (Path(ML_META_FILE).parent / "model_manifest.json").as_posix(),
+    )
+)
+
+#: How long shadow scores are retained by the normal telemetry retention pass.
+ML_SHADOW_RETENTION_DAYS = max(
+    1, int(os.environ.get("BARAQ_ML_SHADOW_RETENTION_DAYS", "7"))
+)
+
 # --------------------------------------------------------------------------
 # ML drift guard (anti "attacker becomes normal")
 # --------------------------------------------------------------------------

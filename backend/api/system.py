@@ -17,12 +17,14 @@ from backend.analyzers import dashboard
 from backend.collectors import CollectorManager
 from backend.config import (
     APP_VERSION,
+    ML_FEATURE_VERSION,
     POWERSHELL_CHANNELS,
     SECURITY_LOG_CHANNELS,
     SYSMON_CHANNELS,
 )
 from backend.database.connection import get_db
 from backend.ml.anomaly import get_detector
+from backend.ml.deployment import deployment_status
 from backend.security import require_admin, require_auth, tenant_scope
 
 logger = logging.getLogger("baraq.api.system")
@@ -620,7 +622,7 @@ def ml_status():
     # v7/v8 enhanced status
     ensemble_status = detector.ensemble.status() if detector.ensemble is not None else None
     online_learning = detector.online_learner is not None
-    feature_version = detector.version
+    deployment = deployment_status()
 
     return {
         **status,
@@ -633,9 +635,78 @@ def ml_status():
         "version_info": info,
         "ensemble": ensemble_status,
         "online_learning": online_learning,
-        "feature_version": feature_version,
+        "feature_version": ML_FEATURE_VERSION,
+        "deployment_mode": deployment["mode"],
+        "manifest_status": deployment["manifest"]["status"],
+        "enforcement_allowed": deployment["enforcement_allowed"],
+        "deployment": deployment,
         "models_trained": list(detector.models.keys()),
     }
+
+
+@router.get("/ml/deployment")
+def ml_deployment_status(hours: int = Query(24, ge=1, le=168)):
+    """Deployment gate plus recent shadow-score monitoring.
+
+    This endpoint is read-only.  Shadow scores are recorded for every scored
+    network bucket in shadow and advisory modes; they never create alerts or
+    response actions.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import func
+
+    from backend.database.connection import SessionLocal
+    from backend.database.models import MLShadowScore
+    from backend.ml.deployment import deployment_status
+
+    deployment = deployment_status()
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    db = SessionLocal()
+    try:
+        base = select(MLShadowScore).where(MLShadowScore.observed_at >= since)
+        total = db.scalar(
+            select(func.count(MLShadowScore.id)).where(
+                MLShadowScore.observed_at >= since
+            )
+        ) or 0
+        flagged = db.scalar(
+            select(func.count(MLShadowScore.id)).where(
+                MLShadowScore.observed_at >= since,
+                MLShadowScore.flagged.is_(True),
+            )
+        ) or 0
+        recent = db.scalars(
+            base.order_by(MLShadowScore.observed_at.desc()).limit(5000)
+        ).all()
+        scores = sorted(float(row.score) for row in recent)
+        if scores:
+            def _pct(p: float) -> float:
+                idx = min(len(scores) - 1, max(0, int(round(p * (len(scores) - 1)))))
+                return round(scores[idx], 6)
+            distribution = {
+                "p50": _pct(0.50),
+                "p95": _pct(0.95),
+                "p99": _pct(0.99),
+                "max": round(scores[-1], 6),
+            }
+        else:
+            distribution = {"p50": None, "p95": None, "p99": None, "max": None}
+        top = db.scalars(
+            base.where(MLShadowScore.flagged.is_(True))
+            .order_by(MLShadowScore.score.desc(), MLShadowScore.observed_at.desc())
+            .limit(20)
+        ).all()
+        return {
+            "deployment": deployment,
+            "window_hours": hours,
+            "shadow_scores": int(total),
+            "shadow_flagged": int(flagged),
+            "score_distribution": distribution,
+            "top_flagged": [row.to_dict() for row in top],
+        }
+    finally:
+        db.close()
 
 
 @router.get("/baseline", dependencies=[Depends(require_auth)])
