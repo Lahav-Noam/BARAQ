@@ -1,8 +1,10 @@
 # ML deployment readiness
 
-Status: **shadow/advisory only (2026-10-26)**. The live bundle remains **v121**.
+Status: **shadow/advisory only (2026-10-27)**. The live bundle remains **v121**.
 No ML-driven response action is enabled, and no model is promoted as a
 general-purpose detector.
+
+**High-level network detector (candidate track)**: See [`docs/ml-high-level-todo.md`](docs/ml-high-level-todo.md) for a separate research/deployment-candidate track with a 92-feature causal detector achieving 98-100% recall on BOTSv1 at 0.52% local FPR. This candidate is **not** a replacement for v121 and does not enable blocking.
 
 This document is the operational contract for the ML layer. It exists because
 the BOTSv1 benchmark produced a near-perfect result that did **not** survive an

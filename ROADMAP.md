@@ -49,6 +49,22 @@ issues".
 
 ---
 
+## High-Level Network ML Detector (Candidate Track)
+
+**Status**: In progress — see [`docs/ml-high-level-todo.md`](docs/ml-high-level-todo.md) for detailed TODO, evidence log, and definition of done.
+
+**Key deliverables**:
+- [`backend/ml/high_level.py`](backend/ml/high_level.py) — 92-feature causal detector (IF + rule fusion)
+- [`scripts/bench_high_level.py`](scripts/bench_high_level.py) — S2/S3/S4 benchmark runner
+- [`scripts/simulate_attack.py`](scripts/simulate_attack.py) — Live-like attack simulation
+- [`validation/external/README.md`](validation/external/README.md) — External validation package
+- [`docs/model-card-high-level.md`](docs/model-card-high-level.md) — Model card
+- [`tests/ml/test_high_level.py`](tests/ml/test_high_level.py) — Unit tests (18 passing)
+
+**Current results**: 98-100% recall on BOTSv1 Campaigns A/B at 0.52% local FPR (S2/S3/S4). Ablation shows rules critical for Campaign A (AUC drops 7.3% without them). Live-like simulation reveals domain-shift limitations.
+
+---
+
 ## Table of Contents
 
 1. [Deployment Blockers](#1-deployment-blockers)
