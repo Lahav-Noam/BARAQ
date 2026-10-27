@@ -135,7 +135,7 @@ Threshold: q0.995 local benign = 0.652. Local FPR on test splits is 2.6% (higher
 - [x] Integration test against a disposable test database (simulation script).
 - [x] Model card and deployment manifest update for the candidate only.
 - [x] Link this TODO from `ROADMAP.md` and `docs/ml-deployment-readiness.md`.
-- [ ] Commit and push without touching `database/model.bundle.joblib` or the
+- [x] Commit and push without touching `database/model.bundle.joblib` or the
       live database.
 
 ## Current evidence
