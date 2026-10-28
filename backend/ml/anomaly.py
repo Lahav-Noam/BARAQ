@@ -2692,6 +2692,8 @@ class MLAnomalyDetector:
         self.model_source = "none"
         #: Phase 2.4: ensemble stacking meta-learner for IF + supervised + Markov fusion.
         self.ensemble = EnsembleStacker() if HAS_ENSEMBLE else None
+        #: Phase 4: recall booster wrapper (UEBA + temporal + adversarial + recall-thresholds).
+        self.recall_booster = None
         #: Phase 2.3: robustness evaluation result (updated after each train).
         self.robustness: dict = {}
         #: Phase 3: online learning wrapper for incremental updates.
@@ -3142,6 +3144,32 @@ class MLAnomalyDetector:
             "history": list(self.versions[-ML_VERSION_HISTORY:]),
             "feedback_weights": dict(self.feedback_weights),
         }
+
+    # ------------------------------------------------------------------
+    # Recall booster integration (Phase 4)
+    # ------------------------------------------------------------------
+    def set_recall_booster(self, booster) -> None:
+        """Attach a RecallBooster instance for UEBA + temporal + recall-threshold scoring."""
+        self.recall_booster = booster
+
+    def update_recall_baselines(self, session, since: datetime | None = None) -> None:
+        """Refresh UEBA and temporal cross-stream baselines from recent events."""
+        if self.recall_booster is not None:
+            self.recall_booster.update_baselines(session, since)
+
+    def score_event_with_recall(self, behavior: str, features: list[float],
+                                user: str = "", event_id: int = 0,
+                                facts: dict | None = None,
+                                ts: datetime | None = None,
+                                source_ip: str = "",
+                                target_user: str = "") -> float:
+        """Score an event with recall enhancement (UEBA + temporal + booster)."""
+        if self.recall_booster is not None:
+            return self.recall_booster.score_event(
+                behavior, features, user=user, event_id=event_id,
+                facts=facts, ts=ts, source_ip=source_ip, target_user=target_user,
+            )
+        return self.score_event_for_behavior(behavior, features)
 
     # ------------------------------------------------------------------
     def _events_since_train(self, session) -> int:
@@ -5188,7 +5216,21 @@ class MLAnomalyDetector:
                     scores = [0.0] * len(feats)
                 for ev, features, combined in zip(evs, feats, scores):
                     try:
-                        score = self._weighted_score(behavior, float(combined))
+                        # Recall booster: apply UEBA + temporal + threshold
+                        # enhancements when a booster is attached.
+                        if self.recall_booster is not None:
+                            facts = (ev.raw_json or {}).get("facts") or {}
+                            score = self.recall_booster.score_event(
+                                behavior, features,
+                                user=ev.user or "",
+                                event_id=ev.event_id,
+                                facts=facts,
+                                ts=ev.timestamp,
+                                source_ip=str(facts.get("source_ip", "") or ""),
+                                target_user=str(facts.get("target_user", "") or ""),
+                            )
+                        else:
+                            score = self._weighted_score(behavior, float(combined))
                     except Exception:
                         logger.exception("Unexpected error")
                         continue
