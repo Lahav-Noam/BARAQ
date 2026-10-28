@@ -111,7 +111,7 @@ except ImportError:  # pragma: no cover
     HAS_XGBOOST = False
 
 try:
-    from backend.ml.ensemble import EnsembleStacker
+    from backend.ml.ensemble import EnsembleStacker, PerStreamStacker
     from backend.ml.online import OnlineLearner
     from backend.ml.robustness import evaluate_robustness
 
@@ -2754,12 +2754,17 @@ class MLAnomalyDetector:
         #: "bootstrap" (bundled seed model on a fresh deployment) or
         #: "user" (trained on this deployment's own telemetry).
         self.model_source = "none"
-        #: Phase 2.4: ensemble stacking meta-learner for IF + supervised + Markov fusion.
-        self.ensemble = EnsembleStacker() if HAS_ENSEMBLE else None
+        #: Phase 2.4: per-stream ensemble stacking meta-learners.  A single
+        #: pooled learner collapsed every benign event in a rare stream to the
+        #: pooled prior, so fusion is now per behaviour with an evidence gate.
+        self.ensemble = PerStreamStacker() if HAS_ENSEMBLE else None
         #: Phase 4: recall booster wrapper (UEBA + temporal + adversarial + recall-thresholds).
         self.recall_booster = None
         #: Phase 2.3: robustness evaluation result (updated after each train).
         self.robustness: dict = {}
+        #: Per-stream score-space diagnostics from the last train (degeneracy,
+        #: threshold provenance). Exposed by ``status()`` and persisted.
+        self.stream_health: dict[str, dict] = {}
         #: Phase 3: online learning wrapper for incremental updates.
         self.online_learner = OnlineLearner(self) if HAS_ENSEMBLE else None
         self._load_meta()
@@ -2824,6 +2829,9 @@ class MLAnomalyDetector:
                         "versions": self.versions[-ML_VERSION_HISTORY:],
                         "train_kind": self.last_train_kind,
                         "feedback_weights": self.feedback_weights,
+                        "ensemble": (
+                            self.ensemble.status() if self.ensemble is not None else None
+                        ),
                     },
                     fh,
                     indent=2,
@@ -2850,6 +2858,11 @@ class MLAnomalyDetector:
                 "baselines": {k: v.tolist() for k, v in self.baselines.items()},
                 "version": self.version,
                 "feedback_weights": self.feedback_weights,
+                # Per-stream meta-learners were trained but never persisted, so
+                # a restart silently downgraded scoring to the plain blend and
+                # live scores stopped matching the validated model.
+                "ensemble": self.ensemble,
+                "stream_health": self.stream_health,
             }
             path = self._bundle_path()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -2895,6 +2908,12 @@ class MLAnomalyDetector:
             self.feedback_weights = {
                 k: float(v) for k, v in (bundle.get("feedback_weights") or {}).items()
             }
+            restored = bundle.get("ensemble")
+            if isinstance(restored, PerStreamStacker):
+                self.ensemble = restored
+            elif restored is not None:
+                logger.info("Ignoring incompatible ensemble in bundle; using blend")
+            self.stream_health = dict(bundle.get("stream_health") or {})
             self._persisted = True
             self.model_source = "user" if not bundle.get("bootstrap") else "bootstrap"
             return bool(self.models)
@@ -2930,6 +2949,14 @@ class MLAnomalyDetector:
             self.baselines = {k: np.asarray(v, dtype=float) for k, v in (bundle.get("baselines") or {}).items()}
             self.version = int(bundle.get("version", 0))
             self.feedback_weights = {k: float(v) for k, v in (bundle.get("feedback_weights") or {}).items()}
+            restored = bundle.get("ensemble")
+            if isinstance(restored, PerStreamStacker):
+                self.ensemble = restored
+            elif HAS_ENSEMBLE:
+                # Never keep the newer meta-learners on top of older base
+                # models: the stack was fitted against a different score space.
+                self.ensemble = PerStreamStacker()
+            self.stream_health = dict(bundle.get("stream_health") or {})
             self.model_source = "user" if not bundle.get("bootstrap") else "bootstrap"
             self._save_meta()
             logger.info("Rolled back to model version %d", self.version)
@@ -3440,10 +3467,21 @@ class MLAnomalyDetector:
                 logger.exception("Unexpected error")
                 p = np.zeros(len(X))
             if meta is not None and getattr(meta, "is_trained", False):
-                scores = np.array(
-                    [float(meta.predict(r, pi)) for r, pi in zip(ranks, p)],
-                    dtype=float,
-                )
+                if hasattr(meta, "trained_for"):
+                    # Per-stream stacker: falls back to the blend for streams
+                    # without an accepted meta-learner.
+                    scores = np.array(
+                        [
+                            float(meta.predict(stream_name or "", r, pi))
+                            for r, pi in zip(ranks, p)
+                        ],
+                        dtype=float,
+                    )
+                else:
+                    scores = np.array(
+                        [float(meta.predict(r, pi)) for r, pi in zip(ranks, p)],
+                        dtype=float,
+                    )
             else:
                 scores = 0.6 * ranks + 0.4 * p
         else:
@@ -4646,46 +4684,48 @@ class MLAnomalyDetector:
             self.n_samples = n_samples
             self.encoders = {}  # No longer using LabelEncoder for network
 
-            # Phase 2.4: Train ensemble meta-learner on held-out base model predictions
+            # Phase 2.4: per-stream meta-learners on out-of-fold predictions.
+            # The returned OOF scores are also the honest basis for the
+            # operating point, so they replace the in-sample CFAR thresholds.
+            threshold_sources: dict[str, dict] = {}
+            stream_health: dict[str, dict] = {}
             if self.ensemble is not None and len(new_models) >= 2:
                 try:
-                    self._train_ensemble_meta(
+                    meta_result = self._train_ensemble_meta(
                         session, new_models, new_supervised_by_stream, new_baselines,
                         stream_X=stream_X, stream_y=stream_y,
-                    )
+                    ) or {}
                 except Exception:
-                    logger.exception("Unexpected error")
-                    logger.debug(
-                        "Ensemble meta-learner training skipped", exc_info=True
-                    )
+                    logger.exception("Ensemble meta-learner training failed")
+                    meta_result = {}
 
-                # Re-tune thresholds in the *stacked* score space once the
-                # meta-learner is live. Without this the stored boundary was
-                # fit on 0.6*rank+0.4*p while _combined_score deploys
-                # meta.predict(...), so CFAR no longer bounded live FPR.
-                if (
-                    self.ensemble is not None
-                    and self.ensemble.is_trained
-                    and new_supervised_by_stream
-                ):
-                    for behavior in new_models:
-                        sup = new_supervised_by_stream.get(behavior)
-                        if sup is None:
-                            continue
-                        _Xt, _yt = stream_X[behavior], stream_y.get(behavior)
-                        if len(_Xt) > 5000:
-                            _rng = np.random.RandomState(42)
-                            _sel = _rng.choice(len(_Xt), 5000, replace=False)
-                            _Xt = _Xt[_sel]
-                            _yt = _yt[_sel] if _yt is not None else None
-                        new_thresholds[behavior], _ = self._tune_threshold(
-                            new_models[behavior], _Xt, _yt,
-                            supervised=sup,
-                            ensembles=new_ensembles.get(behavior),
-                            meta=self.ensemble,
-                            stream_name=behavior,
-                        )
+                for behavior, (oos, ooy) in (meta_result.get("oof") or {}).items():
+                    target_fpr = ML_STREAM_FPR.get(behavior, ML_TARGET_FPR)
+                    thr, info = self._threshold_from_scores(oos, ooy, target_fpr)
+                    # Out-of-fold scores are authoritative: clamping this to the
+                    # in-sample CFAR value is exactly how the configured 5% FPR
+                    # used to realise 15% in production.
+                    new_thresholds[behavior] = thr
+                    info["target_fpr"] = target_fpr
+                    threshold_sources[behavior] = info
+                if meta_result.get("oof"):
                     self.thresholds = new_thresholds
+
+            # Score-space health per stream: can this stream rank events at all?
+            for behavior in new_models:
+                stream_health[behavior] = self._stream_score_health(
+                    stream_X.get(behavior), stream_y.get(behavior)
+                )
+                src = threshold_sources.get(behavior, {}).get("source", "in-sample")
+                stream_health[behavior]["threshold_source"] = src
+                if stream_health[behavior].get("degenerate"):
+                    logger.warning(
+                        "ML stream %s is degenerate (only %s distinct benign "
+                        "scores): percentile thresholds are not reliable",
+                        behavior,
+                        stream_health[behavior].get("distinct_benign_scores"),
+                    )
+            self.stream_health = stream_health
 
             # Phase 2.3: Run robustness evaluation on trained models.
             # Skipped for tiny baselines (and BARAQ_ML_SKIP_ROBUSTNESS=1):
@@ -4824,6 +4864,9 @@ class MLAnomalyDetector:
                 "streams": list(self.models.keys()),
                 "supervised": self.supervised_name,
                 "thresholds": self.thresholds,
+                "threshold_sources": threshold_sources,
+                "stream_health": stream_health,
+                "meta": self.ensemble.status() if self.ensemble is not None else None,
                 "trained_at": self.trained_at,
                 "holdout_metrics": _holdout_metrics,
             }
@@ -4865,70 +4908,124 @@ class MLAnomalyDetector:
         new_baselines: dict,
         stream_X: dict | None = None,
         stream_y: dict | None = None,
-    ) -> None:
-        """Train the ensemble stacking meta-learner on base model predictions.
+    ) -> dict:
+        """Fit one meta-learner per stream on **out-of-fold** base predictions.
 
-        Uses pre-computed stream_X/stream_y when available to avoid re-querying
-        the full event table via _labeled_samples().
+        The old implementation concatenated every stream into a single learner
+        and fitted it on in-sample predictions.  Two failure modes followed:
+
+        * the pooled prior dominated the rare stream, so every benign process
+          event received the identical score (a point mass, not a ranking);
+        * in-sample predictions made the biometrics look perfect during
+          training and unrealisable in production.
+
+        Here each stream is split chronologically: a throwaway copy of the base
+        models is fitted on the first 75 % and only its predictions on the last
+        25 % are used as meta-features.  A stream whose learner cannot separate
+        that hold-out better than the plain blend is rejected and stays on the
+        blend (see :meth:`PerStreamStacker.fit_stream`).
         """
         if self.ensemble is None or not HAS_ENSEMBLE:
-            return
+            return {}
 
-        all_if_scores = []
-        all_sup_probas = []
-        all_labels = []
-
+        decisions: dict[str, dict] = {}
+        oof_scores: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for behavior, model in new_models.items():
-            # Prefer pre-computed features over expensive _labeled_samples
             if stream_X and behavior in stream_X and stream_y and behavior in stream_y:
-                X = stream_X[behavior]
-                y = stream_y[behavior]
+                X = np.asarray(stream_X[behavior], dtype=float)
+                y = np.asarray(stream_y[behavior]).astype(int)
             else:
                 labeled = self._labeled_samples(session)
                 if behavior not in labeled:
                     continue
                 atk, ben = labeled[behavior]
-                if not atk or not ben:
+                if len(atk) == 0 or len(ben) == 0:
                     continue
                 X = np.vstack([ben, atk])
                 y = np.array([0] * len(ben) + [1] * len(atk))
-            if len(X) < 10:
+
+            if len(X) < 100:
+                decisions[behavior] = {
+                    "status": "insufficient-data",
+                    "trained": False,
+                    "n_samples": int(len(X)),
+                }
                 continue
-            # Cap ensemble training to 3000 samples for speed
+
+            # Even decimation keeps chronological order (the stream arrays are
+            # timestamp-ordered); random sampling would leak future rows into
+            # the fold that is supposed to precede them.
             if len(X) > 3000:
-                _rng = np.random.RandomState(ML_RANDOM_STATE)
-                _sel = _rng.choice(len(X), 3000, replace=False)
-                X, y = X[_sel], y[_sel]
+                keep = np.linspace(0, len(X) - 1, 3000).astype(int)
+                X, y = X[keep], y[keep]
+
+            split = int(len(X) * 0.75)
+            X_tr, y_tr = X[:split], y[:split]
+            X_ho, y_ho = X[split:], y[split:]
+            needed = self.ensemble.MIN_POSITIVES
+
+            if int(np.sum(y_tr == 1)) < 3 or int(np.sum(y_tr == 0)) < 3:
+                decisions[behavior] = {
+                    "status": "insufficient-labels-in-fit-window",
+                    "trained": False,
+                    "positives": int(np.sum(y_tr == 1)),
+                }
+                continue
+            if int(np.sum(y_ho == 1)) < needed:
+                decisions[behavior] = {
+                    "status": "insufficient-labels-in-holdout",
+                    "trained": False,
+                    "positives": int(np.sum(y_ho == 1)),
+                    "min_positives": needed,
+                }
+                continue
 
             try:
-                raws = self._score_batch(model, X)
-                if_ranks = self._rank_of(raws, new_baselines.get(behavior))
+                fold_if = IsolationForest(
+                    contamination=ML_CONTAMINATION,
+                    random_state=ML_RANDOM_STATE,
+                    n_estimators=50,
+                    max_samples=min(256, len(X_tr)),
+                    n_jobs=1,
+                )
+                fold_if.fit(X_tr)
+                fold_baseline = self._compact_baseline(
+                    self._score_batch(fold_if, X_tr)
+                )
+                fold_sup, _fold_name = self._build_classifier(X_tr, y_tr)
+                proba = fold_sup.predict_proba(X_ho)
+                p_ho = proba[:, 1] if proba.shape[1] > 1 else np.zeros(len(X_ho))
+                ranks_ho = self._rank_of(
+                    self._score_batch(fold_if, X_ho), fold_baseline
+                )
             except Exception:
-                logger.exception("Unexpected error")
+                logger.exception("Per-stream meta fold failed for %s", behavior)
+                decisions[behavior] = {"status": "fit-failed", "trained": False}
                 continue
 
-            sup = new_supervised_by_stream.get(behavior)
-            sup_probas = np.zeros(len(X))
-            if sup is not None:
-                try:
-                    proba = sup.predict_proba(X)
-                    if proba.shape[1] > 1:
-                        sup_probas = proba[:, 1]
-                except Exception:
-                    logger.exception("Unexpected error")
-
-            all_if_scores.append(if_ranks)
-            all_sup_probas.append(sup_probas)
-            all_labels.append(y)
-
-        if not all_if_scores:
-            return
-
-        if_scores = np.concatenate(all_if_scores)
-        sup_probas = np.concatenate(all_sup_probas)
-        labels = np.concatenate(all_labels)
-
-        self.ensemble.train_meta(if_scores, sup_probas, None, labels)
+            decisions[behavior] = self.ensemble.fit_stream(
+                behavior, ranks_ho, p_ho, y_ho
+            )
+            # Scores on rows the fold models never saw - the only honest basis
+            # for choosing an operating point.
+            try:
+                oof_scores[behavior] = (
+                    np.asarray(
+                        self.ensemble.predict_batch(behavior, ranks_ho, p_ho),
+                        dtype=float,
+                    ),
+                    y_ho,
+                )
+            except Exception:
+                logger.exception("OOF scoring failed for %s", behavior)
+            logger.info(
+                "ML meta [%s]: %s (meta_auc=%s blend_auc=%s)",
+                behavior,
+                decisions[behavior].get("status"),
+                decisions[behavior].get("meta_auc"),
+                decisions[behavior].get("blend_auc"),
+            )
+        return {"decisions": decisions, "oof": oof_scores}
 
     @staticmethod
     def _build_classifier(X, y):
@@ -4976,7 +5073,15 @@ class MLAnomalyDetector:
             model.fit(X, y)
             name = "random_forest"
 
-        # Phase 2: Enhanced calibration with quality validation
+        # Phase 2: calibration.  Isotonic regression is piecewise constant: on
+        # a rare-attack stream it maps the entire benign region to one
+        # probability, which destroys per-event ranking (every benign process
+        # event scored exactly 0.000539, so triage order was meaningless).
+        # Only enable it once there is enough data for the bins to be real;
+        # otherwise Platt scaling keeps the mapping strictly monotone.
+        _ISOTONIC_MIN_POS = 200
+        _ISOTONIC_MIN_NEG = 2000
+        _use_isotonic = pos >= _ISOTONIC_MIN_POS and neg >= _ISOTONIC_MIN_NEG
         if len(y) >= 18 and min(pos, neg) >= 4:
             try:
                 from sklearn.calibration import (
@@ -4985,8 +5090,12 @@ class MLAnomalyDetector:
                 )
                 from sklearn.metrics import brier_score_loss
 
-                # Try isotonic regression first (preferred, non-parametric)
                 min_cv = min(3, min(pos, neg))
+                if not _use_isotonic:
+                    cal = CalibratedClassifierCV(model, cv=min_cv, method="sigmoid")
+                    cal.fit(X, y)
+                    return cal, name + "+platt"
+
                 cal = CalibratedClassifierCV(model, cv=min_cv, method="isotonic")
                 cal.fit(X, y)
 
@@ -5027,6 +5136,98 @@ class MLAnomalyDetector:
                 logger.exception("Unexpected error")
         return model, name
 
+    @staticmethod
+    def _threshold_from_scores(
+        scores, labels, target_fpr: float
+    ) -> tuple[float, dict]:
+        """Choose an operating point from **out-of-fold** deployed scores.
+
+        ``_tune_threshold`` has to build its candidate scores from a model and
+        a feature matrix, so when a stream is scored through a stacked path the
+        boundary can drift from what serving actually emits.  Here the scores
+        are already the values serving will compare against, computed on rows
+        the fold models never saw, which is the only honest place to measure an
+        FPR budget.
+
+        Returns ``(threshold, metrics)``.
+        """
+        scores = np.asarray(scores, dtype=float)
+        y = np.asarray(labels).astype(int)
+        pos = int(y.sum())
+        neg = int(len(y) - pos)
+        if pos == 0 or neg == 0:
+            cfar = float(np.quantile(scores, 1.0 - target_fpr)) if len(scores) else 0.5
+            return cfar, {"positives": pos, "negatives": neg, "source": "cfar-only"}
+
+        benign = scores[y == 0]
+        cfar = float(np.quantile(benign, 1.0 - target_fpr))
+        candidates = np.unique(np.round(scores, 9))
+        best_t, best_f1 = cfar, -1.0
+        for t in candidates:
+            if t > cfar:
+                continue
+            flagged = scores > t
+            tp = int(np.sum(flagged & (y == 1)))
+            fp = int(np.sum(flagged & (y == 0)))
+            if fp / neg > target_fpr:
+                continue
+            recall = tp / pos
+            precision = tp / max(tp + fp, 1)
+            f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+            if f1 > best_f1:
+                best_t, best_f1 = float(t), f1
+        flagged = scores > best_t
+        tp = int(np.sum(flagged & (y == 1)))
+        fp = int(np.sum(flagged & (y == 0)))
+        return best_t, {
+            "source": "out-of-fold",
+            "positives": pos,
+            "negatives": neg,
+            "recall": round(tp / pos, 4),
+            "fpr": round(fp / neg, 4),
+        }
+
+    def _stream_score_health(
+        self, X: np.ndarray | None, y: np.ndarray | None, sample: int = 300
+    ) -> dict:
+        """Check that a stream emits a usable *ranking*, not a point mass.
+
+        A stream whose benign events all receive the same score cannot be
+        triaged or thresholded, no matter what recall it appears to have. This
+        is measured on the last ``sample`` rows (the freshest behaviour) and
+        written into training metadata so the dashboard/API can expose it.
+        """
+        if X is None or len(X) == 0:
+            return {"available": False}
+        tail = X[-sample:]
+        tail_y = y[-sample:] if y is not None and len(y) >= len(tail) else None
+        try:
+            scores = np.asarray(
+                self.score_events([list(row) for row in tail]), dtype=float
+            )
+        except Exception:
+            logger.exception("Score health check failed")
+            return {"available": False}
+        unique_all = int(len(np.unique(np.round(scores, 12))))
+        benign = (
+            scores[np.asarray(tail_y) == 0] if tail_y is not None else scores
+        )
+        unique_benign = int(len(np.unique(np.round(benign, 12))))
+        mode_share = 0.0
+        if len(benign):
+            vals, counts = np.unique(np.round(benign, 12), return_counts=True)
+            mode_share = float(counts.max() / len(benign))
+        return {
+            "available": True,
+            "sampled": int(len(tail)),
+            "distinct_scores": unique_all,
+            "distinct_benign_scores": unique_benign,
+            "benign_mode_share": round(mode_share, 3),
+            # < 10 distinct benign scores is not enough for percentile
+            # thresholding; the stream is reported as unvalidated.
+            "degenerate": unique_benign < 10,
+        }
+
     # ------------------------------------------------------------------
     def _combined_score(self, behavior: str, model, features: list[float]) -> float:
         """Blend IF anomaly signal with supervised classifier probability.
@@ -5051,9 +5252,9 @@ class MLAnomalyDetector:
             return base
         p = self.supervised_proba(features, classifier)
 
-        # Phase 2.4: Use ensemble meta-learner when available
+        # Phase 2.4: per-stream meta-learner when one was accepted for this stream
         if self.ensemble is not None and self.ensemble.is_trained:
-            return float(max(0.0, min(1.0, self.ensemble.predict(base, p))))
+            return float(max(0.0, min(1.0, self.ensemble.predict(behavior, base, p))))
 
         return float(max(0.0, min(1.0, 0.6 * base + 0.4 * p)))
 
@@ -5110,7 +5311,9 @@ class MLAnomalyDetector:
                     logger.exception("Unexpected error")
                     p = np.zeros(len(features_list), dtype=float)
             if self.ensemble is not None and self.ensemble.is_trained:
-                scores = np.clip(self.ensemble.predict_batch(base, p), 0.0, 1.0)
+                scores = np.clip(
+                    self.ensemble.predict_batch(behavior, base, p), 0.0, 1.0
+                )
             else:
                 scores = np.clip(0.6 * base + 0.4 * p, 0.0, 1.0)
             return [float(x) for x in scores]
@@ -5121,21 +5324,61 @@ class MLAnomalyDetector:
                 for features in features_list
             ]
 
-    def score_event(self, features: list[float]) -> float:
-        """Anomaly score in [0,1]; higher = more anomalous.
+    def _behavior_for_vector(self, features: list[float]) -> str:
+        """Route a feature vector to the stream model that can actually score it.
 
-        Routes to the per-behavior model via the event_id carried in the
-        first feature (login/process vectors both start with it), falling
-        back to the login model for generic callers.
+        ``features[0]`` is the event id **only** for process vectors: login
+        vectors start with ``logon_type`` (see ``event_feature_vector``). The
+        process stream legitimately contains event ids ``10`` and ``11``, which
+        are also the RDP and cached logon types, so routing on the first value
+        alone sent 37-dim login vectors into the 48-dim process model, logged
+        ``feature dim 37 != model dim 48`` and returned a flat 0.0 score.
+
+        Feature width is unambiguous for these streams, so it decides first;
+        the event id is only consulted when two models share a width.
         """
-        if not self.is_ready:
-            return 0.0
+        by_dim: dict[int, list[str]] = {}
+        for name, model in self.models.items():
+            width = int(getattr(model, "n_features_in_", -1))
+            by_dim.setdefault(width, []).append(name)
+
+        candidates = by_dim.get(len(features), [])
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            try:
+                by_id = _behavior_of(int(features[0]))
+            except (TypeError, ValueError, IndexError):
+                by_id = None
+            if by_id in candidates:
+                return by_id
+            return "login" if "login" in candidates else sorted(candidates)[0]
+
+        # No model matches this width: keep the historical event-id routing so
+        # a partial bundle still scores what it can, but say so out loud.
         try:
             behavior = _behavior_of(int(features[0]))
         except (TypeError, ValueError, IndexError):
             behavior = "login"
         if behavior not in self.models:
             behavior = "login" if "login" in self.models else next(iter(self.models))
+        logger.warning(
+            "No stream model accepts a %d-feature vector (models: %s); "
+            "routing by event id to %s",
+            len(features),
+            {k: int(getattr(m, "n_features_in_", -1)) for k, m in self.models.items()},
+            behavior,
+        )
+        return behavior
+
+    def score_event(self, features: list[float]) -> float:
+        """Anomaly score in [0,1]; higher = more anomalous.
+
+        Routes to the per-behavior model via :meth:`_behavior_for_vector`.
+        """
+        if not self.is_ready:
+            return 0.0
+        behavior = self._behavior_for_vector(features)
         model = self.models.get(behavior)
         return self._weighted_score(
             behavior, self._combined_score(behavior, model, features)
@@ -5151,14 +5394,7 @@ class MLAnomalyDetector:
         out: list[float] = [0.0] * len(features_list)
         groups: dict[str, list[int]] = {}
         for idx, features in enumerate(features_list):
-            try:
-                behavior = _behavior_of(int(features[0]))
-            except (TypeError, ValueError, IndexError):
-                behavior = "login"
-            if behavior not in self.models:
-                behavior = (
-                    "login" if "login" in self.models else next(iter(self.models))
-                )
+            behavior = self._behavior_for_vector(features)
             groups.setdefault(behavior, []).append(idx)
         for behavior, idxs in groups.items():
             model = self.models.get(behavior)
@@ -5204,9 +5440,11 @@ class MLAnomalyDetector:
                 except Exception:
                     logger.exception("Unexpected error")
                     p = np.zeros(len(idxs), dtype=float)
-            # Phase 2.4: Use ensemble meta-learner when available
+            # Phase 2.4: per-stream meta-learner when available
             if self.ensemble is not None and self.ensemble.is_trained:
-                scores = np.clip(self.ensemble.predict_batch(base, p), 0.0, 1.0)
+                scores = np.clip(
+                    self.ensemble.predict_batch(behavior, base, p), 0.0, 1.0
+                )
             else:
                 scores = np.clip(0.6 * base + 0.4 * p, 0.0, 1.0)
             weight = self.feedback_weights.get(behavior, 1.0)
@@ -5680,6 +5918,8 @@ class MLAnomalyDetector:
             "drift": drifted,
             "drift_reason": drift_reason,
         }
+        if self.stream_health:
+            result["stream_health"] = self.stream_health
         # Operator-facing: disclose when ML is not yet contributing (fresh
         # deployment, 0 flagged anomalies) so the UI can warn instead of
         # silently showing a healthy model that never fires.

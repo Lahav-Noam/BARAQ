@@ -60,6 +60,11 @@ BEHAVIORS = ("login", "process")
 TARGET_RECALL = 0.80
 TARGET_FPR = 0.10
 
+#: Fewer distinct benign scores than this is not a ranking: a threshold can
+#: only land in a gap between discrete values, so recall/FPR at that cut is an
+#: artefact. Kept in sync with ``MLAnomalyDetector._stream_score_health``.
+DEGENERATE_MIN_DISTINCT = 10
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -99,7 +104,7 @@ def _metrics(labels: list[int], scores: list[float], threshold: float) -> dict:
     precision = tp / max(tp + fp, 1)
     f1 = 2 * precision * recall / max(precision + recall, 1e-12)
     return {
-        "threshold": round(threshold, 4),
+        "threshold": round(threshold, 6),
         "samples": total,
         "positives": tp + fn,
         "negatives": tn + fp,
@@ -115,19 +120,30 @@ def _metrics(labels: list[int], scores: list[float], threshold: float) -> dict:
 
 
 def _recall_at_fpr(labels: list[int], scores: list[float], target_fpr: float) -> dict:
-    """Best recall achievable while holding FPR <= target (label-aware knee)."""
-    pairs = sorted(zip(scores, labels), reverse=True)
+    """Best recall achievable while holding FPR <= target (label-aware knee).
+
+    Ties are handled by score bucket: a threshold can never split events that
+    share the same score, so the whole bucket is added at once.  Without this,
+    a stream whose scores are a single point mass (e.g. every benign event
+    scoring exactly 0.000440) looks perfect simply because sorting happened to
+    place the positives first.
+    """
     n_pos = sum(labels)
     n_neg = len(labels) - n_pos
     if n_pos == 0 or n_neg == 0:
         return {"target_fpr": target_fpr, "recall": None, "threshold": None}
+
+    buckets: dict[float, list[int]] = {}
+    for score, y in zip(scores, labels):
+        bucket = buckets.setdefault(float(score), [0, 0])
+        bucket[0 if y else 1] += 1
+
     tp = fp = 0
     best = {"recall": 0.0, "threshold": 1.01}
-    for score, y in pairs:
-        if y:
-            tp += 1
-        else:
-            fp += 1
+    for score in sorted(buckets, reverse=True):
+        pos, neg = buckets[score]
+        tp += pos
+        fp += neg
         if fp / n_neg <= target_fpr:
             recall = tp / n_pos
             if recall > best["recall"]:
@@ -135,8 +151,10 @@ def _recall_at_fpr(labels: list[int], scores: list[float], target_fpr: float) ->
     return {
         "target_fpr": target_fpr,
         "recall": round(best["recall"], 4),
-        "threshold": round(best["threshold"], 4),
+        "threshold": round(best["threshold"], 6),
+        "distinct_scores": len(buckets),
     }
+
 
 
 def _recommended_threshold(
@@ -145,15 +163,22 @@ def _recommended_threshold(
     """Threshold maximising F1 subject to ``FPR <= target_fpr``.
 
     Candidates are the midpoints between *distinct* scores, so a stream whose
-    benign scores are a point mass (common when a calibrated meta-learner
-    collapses a rare stream to its base rate) still yields a usable split
+    benign scores are concentrated on a few values still yields a usable split
     instead of a quantile that lands exactly on the mass.
+
+    Returns ``None`` when the stream is degenerate (fewer than
+    ``DEGENERATE_MIN_DISTINCT`` distinct benign scores): with four values a
+    midpoint can sit in an attack/benign gap and report "100 % recall at 0 %
+    FPR" that says nothing about ranking. ``_score_health`` reports the reason.
     """
     import numpy as np
 
     y = np.asarray(labels, dtype=int)
     s = np.asarray(scores, dtype=float)
     if y.sum() == 0 or (1 - y).sum() == 0:
+        return None
+    benign = s[y == 0]
+    if len(np.unique(benign)) < DEGENERATE_MIN_DISTINCT:
         return None
     uniq = np.unique(s)
     if len(uniq) == 1:
@@ -187,6 +212,33 @@ def _sweep(labels: list[int], scores: list[float]) -> list[dict]:
             }
         )
     return out
+
+
+def _score_health(labels: list[int], scores: list[float]) -> dict:
+    """Describe how much the scores can actually discriminate.
+
+    A stream whose benign events share a handful of scores cannot produce a
+    meaningful threshold: any cut lands between discrete values and reports a
+    fictitious "0 % FPR / 100 % recall". Reporting ``degenerate`` stops that
+    from being read as detection quality.
+
+    The bar is ``DEGENERATE_MIN_DISTINCT`` distinct benign scores, matching the
+    detector's own ``_stream_score_health``. A network stream that emitted four
+    values across 195 benign events is not a ranking, even though the four
+    values are not literally identical.
+    """
+    benign = [s for s, y in zip(scores, labels) if not y]
+    distinct_all = len(set(scores))
+    distinct_benign = len(set(benign))
+    mode_share = 0.0
+    if benign:
+        mode_share = max(benign.count(v) for v in set(benign)) / len(benign)
+    return {
+        "distinct_scores": distinct_all,
+        "distinct_benign_scores": distinct_benign,
+        "benign_mode_share": round(mode_share, 3),
+        "degenerate": distinct_benign < DEGENERATE_MIN_DISTINCT,
+    }
 
 
 def _fmt_pct(value) -> str:
@@ -339,6 +391,7 @@ def run(holdout_fraction: float, train: bool, retrain_full: bool,
                 entry["recommended_threshold"] = _recommended_threshold(
                     labels, vals, TARGET_FPR
                 )
+                entry["score_health"] = _score_health(labels, vals)
             if ver and len({r["verdict"] for r in ver}) == 2:
                 labels = [r["verdict"] for r in ver]
                 vals = [r["score"] for r in ver]
@@ -397,6 +450,7 @@ def run(holdout_fraction: float, train: bool, retrain_full: bool,
                 entry["recommended_threshold"] = _recommended_threshold(
                     labels, vals, TARGET_FPR
                 )
+                entry["score_health"] = _score_health(labels, vals)
             ver = [r for r in net_scored if r["verdict"] is not None]
             if ver and len({r["verdict"] for r in ver}) == 2:
                 entry["analyst_verdicts"] = _metrics(
@@ -515,6 +569,31 @@ def render(report: dict) -> str:
                 f"precision={_fmt_pct(rec['precision'])} "
                 f"(configured {entry['threshold']})"
             )
+        src = (report.get("train") or {}).get("threshold_sources", {}).get(behavior)
+        if src:
+            lines.append(
+                f"  threshold   : {src.get('source')} "
+                f"(pos={src.get('positives')} neg={src.get('negatives')} "
+                f"oof recall={_fmt_pct(src.get('recall'))} "
+                f"oof fpr={_fmt_pct(src.get('fpr'))} / budget "
+                f"{_fmt_pct(src.get('target_fpr'))})"
+            )
+        health = entry.get("score_health")
+        if health:
+            lines.append(
+                f"  score health: {health['distinct_scores']} distinct scores "
+                f"({health['distinct_benign_scores']} among benign, "
+                f"{health['benign_mode_share']:.0%} of benign share one value)"
+            )
+            if health["degenerate"]:
+                lines.append(
+                    "  WARNING     : DEGENERATE STREAM - only "
+                    f"{health['distinct_benign_scores']} distinct benign scores "
+                    f"(minimum {DEGENERATE_MIN_DISTINCT}), so recall/FPR above\n"
+                    "                reflect a threshold placed in a gap between "
+                    "discrete values, not real separation.\n"
+                    "                No threshold is recommended for this stream."
+                )
 
     lines.extend(["", "-" * 72, "THRESHOLD SWEEP (seed truth)", ""])
     for behavior, entry in report["streams"].items():
@@ -531,10 +610,17 @@ def render(report: dict) -> str:
     lines.extend(["", "-" * 72, "VERDICT"])
     ok = True
     for behavior, entry in report["streams"].items():
-        if behavior == "network":
-            continue
         m = entry.get("seed_truth") or entry.get("analyst_verdicts")
         if not m:
+            continue
+        health = entry.get("score_health") or {}
+        if health.get("degenerate"):
+            lines.append(
+                f"  {behavior}: UNVALIDATED - only "
+                f"{health['distinct_benign_scores']} distinct benign scores, "
+                "no usable operating point"
+            )
+            ok = False
             continue
         # Prefer the calibrated operating point when the configured
         # threshold does not honour the FPR budget.
@@ -551,6 +637,21 @@ def render(report: dict) -> str:
             + ("  [after threshold recalibration]" if used is not m else "")
         )
     lines.append("")
+    degenerate = [
+        b for b, e in report["streams"].items()
+        if (e.get("score_health") or {}).get("degenerate")
+    ]
+    if degenerate:
+        lines.append(
+            "  CAVEAT: " + ", ".join(degenerate)
+            + " emitted fewer than "
+            f"{DEGENERATE_MIN_DISTINCT} distinct benign scores; treat the"
+        )
+        lines.append(
+            "  per-stream recall/FPR as unmeasured - the threshold sits in a gap "
+            "between discrete scores."
+        )
+        lines.append("")
     lines.append("  OVERALL: " + ("PASS - targets met on this data" if ok else
                                   "FAIL - do not enable autonomous response"))
     lines.append("=" * 72)

