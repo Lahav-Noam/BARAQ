@@ -3453,7 +3453,16 @@ class MLAnomalyDetector:
             cfar = float(np.quantile(score_baseline, 1.0 - target_fpr))
         else:
             cfar = 0.5
-        cfar = float(np.clip(cfar, 0.05, 0.98))
+        # Clamp inside the *observed* deployed-score range.  The previous
+        # hard ``[0.05, 0.98]`` clamp assumed the deployed score is roughly
+        # uniform over [0, 1] (true for IF ranks).  It is not true once a
+        # probability-calibrated meta-learner is deployed: a stream with
+        # ~0.1% attack prevalence emits scores around 1e-3, so the clamp
+        # produced a threshold the model could never reach and the stream
+        # silently stopped alerting entirely.
+        _score_lo = float(np.min(score_baseline)) if len(score_baseline) else 0.0
+        _score_hi = float(np.max(score_baseline)) if len(score_baseline) else 1.0
+        cfar = float(np.clip(cfar, _score_lo, _score_hi))
         if y is None or len(np.unique(y)) < 2:
             return cfar, baseline
         # The F1 grid may only lower the boundary while keeping the
@@ -3467,8 +3476,8 @@ class MLAnomalyDetector:
         if len(benign) > 0:
             floor = float(np.quantile(benign, 1.0 - target_fpr))
         else:
-            floor = 0.05
-        floor = float(np.clip(floor, 0.05, 0.98))
+            floor = _score_lo
+        floor = float(np.clip(floor, _score_lo, _score_hi))
         # best_j must start as a *metric* sentinel (not floor): initializing
         # it to floor made `best_j > 0` true even when no Youden candidate
         # was ever accepted, returning the untouched best_j_t = -1.0 and
@@ -4785,7 +4794,7 @@ class MLAnomalyDetector:
                                 _X_eval_arr = np.array(_X_eval, dtype=float)
                                 _y_eval_arr = np.array(_y_eval, dtype=int)
                                 _model = new_models[behavior]
-                                _scores = detector.score_events(
+                                _scores = self.score_events(
                                     [list(f) for f in _X_eval_arr]
                                 )
                                 # Evaluate at the stream's new threshold
@@ -5158,8 +5167,26 @@ class MLAnomalyDetector:
             try:
                 X = np.array([features_list[i] for i in idxs], dtype=float)
             except (TypeError, ValueError):
+                # Ragged rows: never silently return zeros - that turns a
+                # feature-space mismatch into a stream that stops alerting.
+                logger.warning(
+                    "score_events: %s has ragged feature rows; falling back to "
+                    "per-row scoring",
+                    behavior,
+                )
+                for i in idxs:
+                    out[i] = self.score_event(features_list[i])
                 continue
             if X.shape[1] != model.n_features_in_:
+                logger.warning(
+                    "score_events: %s feature dim %d != model dim %d; "
+                    "falling back to per-row scoring",
+                    behavior,
+                    X.shape[1],
+                    model.n_features_in_,
+                )
+                for i in idxs:
+                    out[i] = self.score_event(features_list[i])
                 continue
             try:
                 raw = 0.5 - model.decision_function(X)
