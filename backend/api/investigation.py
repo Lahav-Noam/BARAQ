@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from backend.audit import client_ip, log_action
 from backend.database.connection import get_db
 from backend.database.models import (
     Alert,
@@ -15,7 +16,7 @@ from backend.database.models import (
     NetworkConnection,
     NormalizedEvent,
 )
-from backend.security import require_auth
+from backend.security import actor_name, require_auth, tenant_scope
 
 router = APIRouter(
     prefix="/api/investigation",
@@ -26,6 +27,7 @@ router = APIRouter(
 
 @router.get("/process-tree")
 def process_tree(
+    request: Request,
     alert_id: int | None = None,
     host: str = "",
     hours: int = 6,
@@ -39,7 +41,11 @@ def process_tree(
     from backend.investigation.process_tree import build_process_tree
 
     if alert_id is not None:
-        alert = db.get(Alert, alert_id)
+        scope = tenant_scope(request)
+        stmt = select(Alert).where(Alert.id == alert_id)
+        if scope is not None:
+            stmt = stmt.where(Alert.org == scope)
+        alert = db.scalars(stmt).first()
         if not alert:
             raise HTTPException(404, "Alert not found")
         evidence_events = [link.event for link in alert.events if link.event]
@@ -121,8 +127,12 @@ def _attack_chain(db: Session, alert: Alert) -> list[dict]:
 
 
 @router.get("/alert/{alert_id}")
-def investigate(alert_id: int, db: Session = Depends(get_db)):
-    alert = db.get(Alert, alert_id)
+def investigate(alert_id: int, request: Request, db: Session = Depends(get_db)):
+    scope = tenant_scope(request)
+    stmt = select(Alert).where(Alert.id == alert_id)
+    if scope is not None:
+        stmt = stmt.where(Alert.org == scope)
+    alert = db.scalars(stmt).first()
     if not alert:
         raise HTTPException(404, "Alert not found")
 

@@ -57,9 +57,12 @@ def run_detection(
             continue
         try:
             finding = detector.evaluate(event, context)
-        except Exception:
-            logger.exception(
-                "detector %s failed on event %s", detector.id, event.action
+        except Exception as exc:
+            logger.warning(
+                "detector %s failed on event %s: %s",
+                detector.id,
+                event.action,
+                exc,
             )
             continue
         if finding is not None:

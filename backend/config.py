@@ -1428,7 +1428,7 @@ DATA_QUALITY_CRITICAL_RATE = float(
 #: Auto-run the repair sequence (clear logs, restart EventLog service,
 #: retrain ML) when the window corruption rate crosses CRITICAL.
 DATA_QUALITY_AUTO_REPAIR = os.environ.get(
-    "BARAQ_DATA_QUALITY_AUTO_REPAIR", "1"
+    "BARAQ_DATA_QUALITY_AUTO_REPAIR", "0"
 ).lower() in (
     "1",
     "true",
@@ -1508,6 +1508,16 @@ INGEST_ASYNC_DETECT = os.environ.get("BARAQ_INGEST_ASYNC_DETECT", "0").lower() i
 AI_API_URL = os.environ.get("BARAQ_AI_API_URL", "https://integrate.api.nvidia.com/v1")
 AI_API_KEY = _secret("BARAQ_AI_API_KEY", "")
 AI_MODEL = os.environ.get("BARAQ_AI_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
+#: External AI calls are OFF by default. Even when BARAQ_AI_API_URL is set,
+#: the assistant only calls it when BARAQ_AI_EXTERNAL_ENABLED=1, preventing
+#: decrypted alert evidence and conversation history from leaking to an
+#: external provider by accident.
+AI_EXTERNAL_ENABLED = os.environ.get("BARAQ_AI_EXTERNAL_ENABLED", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # --------------------------------------------------------------------------
 # Threat intelligence

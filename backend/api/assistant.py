@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request
+import time
+from collections import defaultdict
+from threading import Lock
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -16,6 +20,32 @@ router = APIRouter(
     tags=["assistant"],
     dependencies=[Depends(require_auth)],
 )
+
+# ── Assistant chat rate limiting ────────────────────────────────────────────
+# Bug #7: the chat endpoint had no rate limiting. A sliding window per
+# authenticated user prevents abuse / exfiltration loops via the assistant.
+_ASSISTANT_RATE_WINDOW = 60  # seconds
+_ASSISTANT_RATE_MAX = 30  # requests per window per user
+_assistant_requests: dict[str, list[float]] = defaultdict(list)
+_assistant_lock = Lock()
+
+
+def _assistant_rate_check(user_id: int | str) -> None:
+    """Raise 429 if the user has exceeded the assistant chat rate limit."""
+    now = time.time()
+    window_start = now - _ASSISTANT_RATE_WINDOW
+    with _assistant_lock:
+        key = str(user_id)
+        timestamps = [t for t in _assistant_requests[key] if t > window_start]
+        if len(timestamps) >= _ASSISTANT_RATE_MAX:
+            retry_after = int(_ASSISTANT_RATE_WINDOW - (now - timestamps[0])) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Assistant rate limit exceeded. Try again in {retry_after}s.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        timestamps.append(now)
+        _assistant_requests[key] = timestamps
 
 
 def _assistant(request: Request, db: Session):
@@ -40,6 +70,8 @@ class EntityExplainRequest(BaseModel):
 
 @router.post("/chat")
 def chat(body: ChatRequest, request: Request, db: Session = Depends(get_db)):
+    user = resolve_user(request, db)
+    _assistant_rate_check(user.id if user is not None else client_ip(request))
     assistant = _assistant(request, db)
     response = assistant.chat(body.message)
     return {"reply": response, "history": assistant.history()}
