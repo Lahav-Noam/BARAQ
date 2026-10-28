@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from sqlalchemy import func, select
 
 from backend.ai.knowledge import INTENTS
-from backend.config import AI_API_KEY, AI_API_URL, AI_MODEL
+from backend.config import AI_API_KEY, AI_API_URL, AI_MODEL, AI_EXTERNAL_ENABLED
 from backend.database.models import (
     Alert,
     AssistantMessage,
@@ -347,9 +347,9 @@ class SecurityAssistant:
                 "evidence, review the linked alerts and close them after action."
             )
 
-        # When BARAQ AI is available, send the structured context for a
-        # richer analyst-style explanation.
-        if AI_API_URL:
+        # When BARAQ AI is available AND externally enabled, send the
+        # structured context for a richer analyst-style explanation.
+        if AI_API_URL and AI_EXTERNAL_ENABLED:
             try:
                 import httpx
 
@@ -930,7 +930,7 @@ class SecurityAssistant:
                 AssistantMessage(user_id=self.user_id, role="user", content=message)
             )
 
-        if AI_API_URL:
+        if AI_API_URL and AI_EXTERNAL_ENABLED:
             response = self._remote_completion(message, intent)
         else:
             response = self._respond(intent, message)

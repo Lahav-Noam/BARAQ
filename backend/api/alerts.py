@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -695,6 +696,42 @@ def take_action(
     action = body.action.value
 
     target = body.target or _extract_target(alert, action)
+
+    # ── SOAR approval gate (P1) ────────────────────────────────────────────
+    # Destructive actions cannot execute until an APPROVED request exists for
+    # this exact (action, target) pair. Without approval we create a pending
+    # request and return 202 pending_approval so a second admin can sign off.
+    if action in DESTRUCTIVE_ACTIONS:
+        from backend.response.approval import (
+            ApprovalRequest,
+            workflow,
+        )
+
+        action_params = {"action": action, "target": target}
+        if not workflow.is_approved(action, action_params):
+            existing = workflow.pending_for(action, action_params)
+            if existing is None:
+                existing = workflow.create_request(
+                    ApprovalRequest(
+                        action_type=action,
+                        action_params=action_params,
+                        requested_by=actor_name(request),
+                        justification=body.note or "",
+                        approvers_required=1,
+                    )
+                )
+            return JSONResponse(
+                {
+                    "status": "pending_approval",
+                    "request_id": existing.id,
+                    "action": action,
+                    "target": target,
+                    "message": "Destructive action requires approval before execution. "
+                    "A second admin must approve the request.",
+                },
+                status_code=202,
+            )
+
     if action in DESTRUCTIVE_ACTIONS:
         status, detail = _queue_remote_action(
             db, alert, action, target, body.triggered_by
@@ -733,6 +770,84 @@ def take_action(
     )
     logger.info("Alert #%s action '%s' -> %s: %s", alert_id, action, status, detail)
     return action_row.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# SOAR approval management (P1)
+# ---------------------------------------------------------------------------
+
+
+class ApprovalApproveRequest(BaseModel):
+    approver: str = Field(min_length=1, max_length=64)
+    reason: str = Field(default="", max_length=500)
+
+
+class ApprovalRejectRequest(BaseModel):
+    approver: str = Field(min_length=1, max_length=64)
+    reason: str = Field(default="", max_length=500)
+
+
+@router.get("/approvals/pending", dependencies=[Depends(require_admin)])
+def list_pending_approvals():
+    """List all pending SOAR approval requests."""
+    from backend.response.approval import workflow
+
+    return {
+        "items": [r.model_dump() for r in workflow.list_pending()],
+        "total": len(workflow.list_pending()),
+    }
+
+
+@router.post("/approvals/{request_id}/approve", dependencies=[Depends(require_admin)])
+def approve_soar_request(
+    request_id: str,
+    body: ApprovalApproveRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Approve a pending SOAR action request (two-person rule)."""
+    from backend.response.approval import workflow
+
+    try:
+        record = workflow.approve(request_id, body.approver.strip())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    log_action(
+        db,
+        actor_name(request),
+        "soar.approve",
+        "approval",
+        request_id,
+        f"approved by {body.approver.strip()}: {body.reason}",
+        client_ip(request),
+    )
+    return {"status": record.status, "request_id": record.id}
+
+
+@router.post("/approvals/{request_id}/reject", dependencies=[Depends(require_admin)])
+def reject_soar_request(
+    request_id: str,
+    body: ApprovalRejectRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Reject a pending SOAR action request."""
+    from backend.response.approval import workflow
+
+    try:
+        record = workflow.reject(request_id, body.approver.strip(), body.reason)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    log_action(
+        db,
+        actor_name(request),
+        "soar.reject",
+        "approval",
+        request_id,
+        f"rejected by {body.approver.strip()}: {body.reason}",
+        client_ip(request),
+    )
+    return {"status": record.status, "request_id": record.id}
 
 
 def _bump_severity(alert: Alert) -> None:
