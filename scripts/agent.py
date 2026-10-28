@@ -139,11 +139,11 @@ def validate_target(action: str, target: str) -> str:
         return target
     if not target:
         raise UnsafeCommand(f"{action} requires a target")
-    if action == "block_ip":
+    if action in ("block_ip", "unblock_ip"):
         try:
             return str(ipaddress.ip_address(target))
         except ValueError:
-            raise UnsafeCommand("block_ip requires a valid IP address") from None
+            raise UnsafeCommand(f"{action} requires a valid IP address") from None
     if action == "kill_process":
         if not _PROCESS_RE.match(target):
             raise UnsafeCommand("kill_process target must be a process name or PID")
@@ -330,6 +330,41 @@ def execute_command(cmd: dict) -> dict:
             )
             success = success or code == 0
         return {"status": "success" if success else "failed", "detail": detail or "ok"}
+
+    if action == "unblock_ip":
+        # Rule names are exact matches for netsh delete, and the two agents
+        # name their block rules differently (this agent: "BARAQ Block <ip>
+        # <dir>"; agent.ps1: "BARAQ-SOAR-<DIR>-<ip>"). Delete both families
+        # so a block created by either agent type can be undone from here.
+        dashed = target.replace(".", "-")
+        names = (
+            f"BARAQ Block {target} in",
+            f"BARAQ Block {target} out",
+            f"BARAQ-SOAR-IN-{dashed}",
+            f"BARAQ-SOAR-OUT-{dashed}",
+        )
+        removed = 0
+        detail = ""
+        for name in names:
+            out, code = _run(
+                [
+                    system_binary("netsh"),
+                    "advfirewall",
+                    "firewall",
+                    "delete",
+                    "rule",
+                    f"name={name}",
+                ]
+            )
+            detail = detail or out
+            if code == 0:
+                removed += 1
+        if removed == 0:
+            return {
+                "status": "failed",
+                "detail": f"no BARAQ block rules found for {target}",
+            }
+        return {"status": "success", "detail": f"unblocked {target} ({removed} rule(s) removed)"}
 
     if action == "kill_process":
         args = ["/F", "/PID", target] if target.isdigit() else ["/F", "/IM", target]
