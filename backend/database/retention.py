@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
-from backend.config import EVENT_RETENTION_DAYS
+from backend.config import EVENT_RETENTION_DAYS, ML_SHADOW_RETENTION_DAYS
 from backend.database.models import (
     Alert,
     DashboardSnapshot,
@@ -21,6 +21,7 @@ from backend.database.models import (
     EmailMessage,
     FileScan,
     HttpRequest,
+    MLShadowScore,
     NetworkConnection,
     NormalizedEvent,
     ProcessRecord,
@@ -64,6 +65,13 @@ def purge_old_data(
         for model, column in _PURGE_TARGETS:
             result = session.execute(delete(model).where(column < cutoff))
             purged[model.__tablename__] = int(result.rowcount or 0)  # type: ignore[attr-defined]
+        # Shadow scores are high-volume operational telemetry and have a
+        # shorter retention window than the underlying events.
+        shadow_cutoff = datetime.now(UTC) - timedelta(days=ML_SHADOW_RETENTION_DAYS)
+        result = session.execute(
+            delete(MLShadowScore).where(MLShadowScore.observed_at < shadow_cutoff)
+        )
+        purged[MLShadowScore.__tablename__] = int(result.rowcount or 0)  # type: ignore[attr-defined]
         session.commit()
     except Exception:
         session.rollback()

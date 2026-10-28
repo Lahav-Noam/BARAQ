@@ -62,8 +62,11 @@ These are **not** optional. Each one leaves a real risk if skipped.
 4. **Typecheck.** `pyright` is not installed; the project has no static type gate. Add it
    to `requirements-dev.txt` in CI or accept the risk knowingly.
 5. **ML detection quality.** The unsupervised layer catches 2/7 unseen attacks on the
-   holdout split. Detection today rides on the rule layer (hybrid recall 0.939). Accept
-   this consciously or fund model work before cutover.
+   holdout split. Detection today rides on the rule layer (hybrid recall 0.939). The
+   loaded v121 bundle has no campaign-held-out validation, so it is **shadow/advisory
+   only**; do not enable autonomous blocking. The deployment contract, promotion gate,
+   monitoring endpoint, and rollback procedure are in
+   [`docs/ml-deployment-readiness.md`](ml-deployment-readiness.md).
 6. **Remote response actions untested on real hardware.** Command *validation* and
    injection defences are unit-tested, and command polling now works over TLS, but no
    live `kill_process` / `quarantine` / `block_ip` has been executed against a real
