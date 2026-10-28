@@ -288,7 +288,11 @@ def create_incident(
     db.flush()
 
     for alert_id in body.alert_ids:
-        alert = db.get(Alert, alert_id)
+        scope = tenant_scope(request)
+        stmt = select(Alert).where(Alert.id == alert_id)
+        if scope is not None:
+            stmt = stmt.where(Alert.org == scope)
+        alert = db.scalars(stmt).first()
         if alert:
             db.add(IncidentAlertLink(incident_id=incident.id, alert_id=alert_id))
             incident.org = alert.org or incident.org
@@ -302,7 +306,15 @@ def create_incident(
         )
     )
 
-    linked_alerts = [db.get(Alert, a) for a in body.alert_ids]
+    linked_alerts = []
+    scope = tenant_scope(request)
+    for a in body.alert_ids:
+        stmt = select(Alert).where(Alert.id == a)
+        if scope is not None:
+            stmt = stmt.where(Alert.org == scope)
+        alert_row = db.scalars(stmt).first()
+        if alert_row:
+            linked_alerts.append(alert_row)
     max_risk = (
         max((a.risk_score or 0.0) for a in linked_alerts if a) if linked_alerts else 0.0
     )
@@ -333,7 +345,11 @@ def update_incident(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    incident = db.get(Incident, incident_id)
+    scope = tenant_scope(request)
+    stmt = select(Incident).where(Incident.id == incident_id)
+    if scope is not None:
+        stmt = stmt.where(Incident.org == scope)
+    incident = db.scalars(stmt).first()
     if not incident:
         raise HTTPException(404, "Incident not found")
     actor = actor_name(request)
@@ -405,7 +421,11 @@ def link_alerts(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    incident = db.get(Incident, incident_id)
+    scope = tenant_scope(request)
+    stmt = select(Incident).where(Incident.id == incident_id)
+    if scope is not None:
+        stmt = stmt.where(Incident.org == scope)
+    incident = db.scalars(stmt).first()
     if not incident:
         raise HTTPException(404, "Incident not found")
 
@@ -414,7 +434,10 @@ def link_alerts(
     for alert_id in body.alert_ids:
         if alert_id in existing:
             continue
-        alert = db.get(Alert, alert_id)
+        stmt = select(Alert).where(Alert.id == alert_id)
+        if scope is not None:
+            stmt = stmt.where(Alert.org == scope)
+        alert = db.scalars(stmt).first()
         if not alert:
             raise HTTPException(404, f"Alert {alert_id} not found")
         db.add(IncidentAlertLink(incident_id=incident_id, alert_id=alert_id))

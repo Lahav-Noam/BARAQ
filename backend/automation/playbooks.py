@@ -168,6 +168,35 @@ def _execute_one(db: Session, alert: Alert, action: str) -> tuple[str, str]:
         except Exception as exc:
             return "failed", f"Notification channel error: {exc}"
         return "success", "Analyst notified out-of-band."
+
+    # ── SOAR approval gate (P1) ────────────────────────────────────────────
+    # Destructive actions executed by playbooks also require an APPROVED
+    # request before they reach the agent.
+    if action in DESTRUCTIVE_ACTIONS:
+        from backend.response.approval import (
+            ApprovalRequest,
+            workflow,
+        )
+
+        action_params = {"action": action, "target": _extract_target(alert, action)}
+        if not workflow.is_approved(action, action_params):
+            existing = workflow.pending_for(action, action_params)
+            if existing is None:
+                existing = workflow.create_request(
+                    ApprovalRequest(
+                        action_type=action,
+                        action_params=action_params,
+                        requested_by=triggered_by,
+                        justification="Auto-fired by playbook "
+                        f"'{playbook.name}' on alert #{alert.id}",
+                        approvers_required=1,
+                    )
+                )
+            return "pending_approval", (
+                f"Destructive action {action} requires approval "
+                f"(request #{existing.id}) before execution"
+            )
+
     target = _extract_target(alert, action)
     return _execute_action(action, target)
 

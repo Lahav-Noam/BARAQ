@@ -254,7 +254,11 @@ def set_agent_tags(
     db: Session = Depends(get_db),
 ):
     """Set (replace) the tag group for one agent - drives fleet grouping."""
-    endpoint = db.get(Endpoint, agent_id)
+    scope = tenant_scope(request)
+    stmt = select(Endpoint).where(Endpoint.agent_id == agent_id)
+    if scope is not None:
+        stmt = stmt.where(Endpoint.org == scope)
+    endpoint = db.scalars(stmt).first()
     if endpoint is None:
         raise HTTPException(404, "Unknown agent - has it reported yet?")
     tags = ",".join(sorted({t for t in body.tags.split(",") if t}))
@@ -378,7 +382,11 @@ def queue_command(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    if not db.get(Endpoint, agent_id):
+    scope = tenant_scope(request)
+    stmt = select(Endpoint).where(Endpoint.agent_id == agent_id)
+    if scope is not None:
+        stmt = stmt.where(Endpoint.org == scope)
+    if not db.scalars(stmt).first():
         raise HTTPException(404, "Unknown agent - has it reported yet?")
     target = _validate_target(body.action.value, body.target)
     command = AgentCommand(
@@ -514,7 +522,11 @@ def record_verdict(
     """
     if body.verdict not in ("true_positive", "false_positive"):
         raise HTTPException(422, "verdict must be true_positive | false_positive")
-    event = db.get(NormalizedEvent, body.event_id)
+    scope = tenant_scope(request)
+    stmt = select(NormalizedEvent).where(NormalizedEvent.id == body.event_id)
+    if scope is not None:
+        stmt = stmt.where(NormalizedEvent.org == scope)
+    event = db.scalars(stmt).first()
     if event is None:
         raise HTTPException(404, "No such event")
     row = db.scalars(select(Verdict).where(Verdict.event_id == body.event_id)).first()

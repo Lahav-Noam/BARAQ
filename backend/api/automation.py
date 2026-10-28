@@ -171,7 +171,11 @@ def test_playbook(
 ):
     """Dry-run a playbook against an existing alert without persisting."""
     playbook = _get_playbook(db, playbook_id)
-    alert = db.get(Alert, alert_id)
+    scope = tenant_scope(request)
+    stmt = select(Alert).where(Alert.id == alert_id)
+    if scope is not None:
+        stmt = stmt.where(Alert.org == scope)
+    alert = db.scalars(stmt).first()
     if alert is None:
         raise HTTPException(404, "alert not found")
     from backend.automation.playbooks import matches
@@ -204,7 +208,11 @@ def run_playbook_now(
 ):
     """Manually execute a playbook against an alert and log the run."""
     playbook = _get_playbook(db, playbook_id)
-    alert = db.get(Alert, alert_id)
+    scope = tenant_scope(request)
+    stmt = select(Alert).where(Alert.id == alert_id)
+    if scope is not None:
+        stmt = stmt.where(Alert.org == scope)
+    alert = db.scalars(stmt).first()
     if alert is None:
         raise HTTPException(404, "alert not found")
     run = run_playbook(db, playbook, alert, triggered_by="manual")
@@ -269,6 +277,14 @@ def get_run(
     playbook = db.get(AutomationPlaybook, run.playbook_id)
     alert = db.get(Alert, run.alert_id) if run.alert_id else None
 
+    # Org-scope the related objects too
+    org = tenant_scope(request)
+    if org is not None:
+        if playbook is not None and getattr(playbook, "org", None) not in (None, "", org):
+            playbook = None
+        if alert is not None and getattr(alert, "org", None) not in (None, "", org):
+            alert = None
+
     return {
         "run": run.to_dict(),
         "playbook": playbook.to_dict() if playbook else None,
@@ -287,7 +303,11 @@ def preview_match(
     db: Session = Depends(get_db),
 ):
     """Which enabled playbooks would fire for a given alert?"""
-    alert = db.get(Alert, alert_id)
+    scope = tenant_scope(request)
+    stmt = select(Alert).where(Alert.id == alert_id)
+    if scope is not None:
+        stmt = stmt.where(Alert.org == scope)
+    alert = db.scalars(stmt).first()
     if alert is None:
         raise HTTPException(404, "alert not found")
     matching = find_matching_playbooks(db, alert)

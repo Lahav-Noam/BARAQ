@@ -982,6 +982,22 @@ def reject_user(user_id: int, request: Request, db: Session = Depends(get_db)):
     return _public_user(user)
 
 
+def _validate_password_strength(password: str) -> None:
+    """Enforce password complexity: at least one uppercase, lowercase, digit."""
+    if not any(c.isupper() for c in password):
+        raise HTTPException(
+            400, "Password must contain at least one uppercase letter"
+        )
+    if not any(c.islower() for c in password):
+        raise HTTPException(
+            400, "Password must contain at least one lowercase letter"
+        )
+    if not any(c.isdigit() for c in password):
+        raise HTTPException(
+            400, "Password must contain at least one digit"
+        )
+
+
 @router.post(
     "/settings/change-password", dependencies=[Depends(require_auth_pending_change)]
 )
@@ -1004,6 +1020,7 @@ def change_password(
             "Choose a different password - the default "
             "bootstrap password cannot be kept",
         )
+    _validate_password_strength(body.new_password)
     user.password_hash = hash_password(body.new_password)
     user.must_change_password = False
     user.password_changed_at = datetime.now(UTC)
@@ -1190,14 +1207,46 @@ def verify_audit_chain(db: Session = Depends(get_db)):
 
 
 @router.post("/audit/clear", dependencies=[Depends(require_admin)])
-def clear_audit(request: Request, db: Session = Depends(get_db)):
+def clear_audit(
+    request: Request,
+    approver: str | None = None,
+    db: Session = Depends(get_db),
+):
     """Delete the entire audit trail, force-generating an executive report first.
 
-    The report is generated while the records still exist, so it captures the
-    full activity before the trail is erased. The forced report remains the
-    permanent record; the hash chain restarts from the new clear entry.
+    Two-person rule: ``approver`` must be the username of a *different*
+    administrator, and both the requesting actor and the approver must be
+    active admins. Without a valid approver the request returns 202 pending.
     """
     from backend.reports.generator import generate_report
+
+    actor = _actor(request)
+
+    # Resolve and validate both parties before doing anything destructive.
+    actor_user = db.scalar(select(User).where(User.username == actor))
+    if not actor_user or actor_user.role != "admin" or not actor_user.is_active:
+        raise HTTPException(403, "Only active administrators can clear the audit trail")
+
+    if not approver:
+        return {
+            "cleared": 0,
+            "status": "pending_approval",
+            "message": "Audit clear requires a second admin approver. "
+            "Resubmit with ?approver=<other-admin-username>.",
+            "report": None,
+        }
+
+    approver_user = db.scalar(select(User).where(User.username == approver.strip()))
+    if (
+        not approver_user
+        or approver_user.role != "admin"
+        or not approver_user.is_active
+        or approver_user.username == actor_user.username
+    ):
+        raise HTTPException(
+            400,
+            "approver must be a different active administrator",
+        )
 
     count = len(db.scalars(select(AuditLog)).all())
     if not count:
@@ -1212,11 +1261,11 @@ def clear_audit(request: Request, db: Session = Depends(get_db)):
     db.commit()
     log_action(
         db,
-        _actor(request),
+        actor,
         "audit.clear",
         "audit",
         "-",
-        f"deleted {count} record(s); report={report['file_path']}",
+        f"deleted {count} record(s) approved by {approver_user.username}; report={report['file_path']}",
         client_ip(request),
     )
     logger.info(

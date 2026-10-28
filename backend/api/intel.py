@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from backend.audit import client_ip, log_action
 from backend.database.connection import get_db
 from backend.database.models import Alert
-from backend.security import actor_name, require_admin, require_auth
+from backend.security import actor_name, require_admin, require_auth, tenant_scope
 from backend.threatintel.service import enrich_alert, lookup_indicator
 
 logger = logging.getLogger("baraq.api.threatintel")
@@ -78,11 +78,16 @@ def intel_lookup(
 @router.get("/alert/{alert_id}")
 def alert_intel(
     alert_id: int,
+    request: Request,
     refresh: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     """Enrich all indicators found in an alert's evidence."""
-    alert = db.get(Alert, alert_id)
+    scope = tenant_scope(request)
+    stmt = select(Alert).where(Alert.id == alert_id)
+    if scope is not None:
+        stmt = stmt.where(Alert.org == scope)
+    alert = db.scalars(stmt).first()
     if not alert:
         raise HTTPException(404, "Alert not found")
     items = enrich_alert(db, alert, refresh=refresh)
