@@ -52,6 +52,7 @@ from backend.config import (
     ML_RETRAIN_AFTER_MINUTES,
     ML_RETRAIN_MIN_NEW_EVENTS,
     ML_RETRAIN_MIN_NEW_VERDICTS,
+    ML_STREAM_FPR,
     ML_TARGET_FPR,
     ML_TRAIN_MIN_SAMPLES,
     ML_VERSION_HISTORY,
@@ -138,7 +139,8 @@ _DEFAULT_THRESHOLDS = {"login": 0.5, "process": 0.5, "network": 0.5}
 
 #: Minimum labelled rows before gradient boosting beats a random forest on
 #: generalization (see :meth:`MLAnomalyDetector._build_classifier`).
-_XGB_MIN_SAMPLES = 400
+#: Lowered from 400 to 100 so small deployments can use XGBoost sooner.
+_XGB_MIN_SAMPLES = 100
 
 # ── Hyperparameter tuning ─────────────────────────────────────────────
 _IF_PARAM_GRID: list[dict] = [
@@ -1897,6 +1899,9 @@ def event_feature_vector(event, _shared_session=None) -> list[float] | None:
             )
 
         if behavior == "process":
+            # Per-user context for process events (fixes empty user string bug)
+            _proc_user = _fact_str(event, "user", "") or _fact_str(event, "target_user", "")
+
             # Base features (with cyclical time encoding)
             base_features = [
                 int(event_id),
@@ -1939,12 +1944,69 @@ def event_feature_vector(event, _shared_session=None) -> list[float] | None:
             cross_stream_features = _get_cross_stream_features(session, int(event_id))
 
             # Phase 2 temporal/contextual features
+            # Per-user process features (user-specific baselines)
+            _proc_user_fail = 0
+            _proc_user_total = 0
+            _proc_user_distinct = 0
+            if _proc_user:
+                try:
+                    _now = datetime.now(UTC)
+                    _hour_ago = _now - timedelta(hours=1)
+                    _day_ago = _now - timedelta(hours=24)
+                    _proc_user_total = int(
+                        session.scalar(
+                            select(func.count(NormalizedEvent.id))
+                            .where(NormalizedEvent.event_id.in_(PROCESS_EVENTS))
+                            .where(NormalizedEvent.timestamp >= _day_ago)
+                            .where(
+                                NormalizedEvent.raw_json["facts"]["user"].cast(String)
+                                == _proc_user
+                            )
+                        )
+                        or 0
+                    )
+                    _proc_user_fail = int(
+                        session.scalar(
+                            select(func.count(NormalizedEvent.id))
+                            .where(NormalizedEvent.event_id == 4625)
+                            .where(NormalizedEvent.timestamp >= _day_ago)
+                            .where(
+                                NormalizedEvent.raw_json["facts"]["user"].cast(String)
+                                == _proc_user
+                            )
+                        )
+                        or 0
+                    )
+                    _proc_user_distinct = min(
+                        1.0,
+                        int(
+                            session.scalar(
+                                select(func.count(func.distinct(NormalizedEvent.raw_json["facts"]["image_path"].cast(String))))
+                                .where(NormalizedEvent.event_id.in_(PROCESS_EVENTS))
+                                .where(NormalizedEvent.timestamp >= _day_ago)
+                                .where(
+                                    NormalizedEvent.raw_json["facts"]["user"].cast(String)
+                                    == _proc_user
+                                )
+                            )
+                            or 0
+                        )
+                        / 20.0,
+                    )
+                except Exception:
+                    logger.exception("Per-user process features failed")
+
+            # Phase 2 temporal/contextual features
             temporal_features = [
                 _get_business_hours_indicator(event),
                 min(_get_event_burst_score(session, "process", 5), 2.0),
                 _get_kill_chain_phase(event),
                 _get_threat_intel_score(event),
-                _get_user_attack_frequency(session, "", 168),
+                _get_user_attack_frequency(session, _proc_user, 168),
+                # Per-user process features (new)
+                min(_proc_user_total / 100.0, 1.0),  # user's process volume 24h
+                min(_proc_user_fail / max(_proc_user_total, 1), 1.0),  # user's failure ratio
+                _proc_user_distinct,  # user's distinct process diversity
             ]
 
             # v7 enhanced features: path entropy, system dir, parent risk, cmd tokens, chain depth
@@ -3320,6 +3382,7 @@ class MLAnomalyDetector:
         y,
         supervised=None,
         target_fpr: float | None = None,
+        stream_name: str | None = None,
         ensembles: list | None = None,
         meta=None,
     ):
@@ -3349,7 +3412,13 @@ class MLAnomalyDetector:
         provided and trained, blended scores go through
         ``meta.predict(rank, p)`` to match the stacked deployment path.
         """
-        target_fpr = ML_TARGET_FPR if target_fpr is None else target_fpr
+        # Phase 4: per-stream FPR budgets - login gets tighter FPR (0.05),
+        # process/network get looser (0.15/0.10) for better recall.
+        if target_fpr is None:
+            if stream_name and stream_name in ML_STREAM_FPR:
+                target_fpr = ML_STREAM_FPR[stream_name]
+            else:
+                target_fpr = ML_TARGET_FPR
         if len(X) == 0:
             return 0.5, np.empty((0,))
         raws = MLAnomalyDetector._score_batch(model, X)
@@ -4526,6 +4595,7 @@ class MLAnomalyDetector:
                         new_models[behavior], _Xt, _yt,
                         supervised=new_supervised_by_stream.get(behavior),
                         ensembles=new_ensembles.get(behavior),
+                        stream_name=behavior,
                     )
                 )
             # Singular fallback keeps legacy callers (score_event) working.
@@ -4604,6 +4674,7 @@ class MLAnomalyDetector:
                             supervised=sup,
                             ensembles=new_ensembles.get(behavior),
                             meta=self.ensemble,
+                            stream_name=behavior,
                         )
                     self.thresholds = new_thresholds
 
@@ -4662,6 +4733,81 @@ class MLAnomalyDetector:
                 self.supervised_name,
                 {k: round(v, 2) for k, v in self.thresholds.items()},
             )
+
+            # Phase 4: Hold-out evaluation on most recent 20% of data
+            # (never seen during training) for honest recall/FPR metrics.
+            _holdout_metrics: dict[str, dict] = {}
+            try:
+                _total_events = int(
+                    session.scalar(select(func.count(NormalizedEvent.id))) or 0
+                )
+                if _total_events >= 100:
+                    _holdout_cutoff = session.execute(
+                        select(NormalizedEvent.timestamp)
+                        .order_by(NormalizedEvent.timestamp.desc())
+                        .offset(int(_total_events * 0.8))
+                        .limit(1)
+                    ).scalar()
+                    if _holdout_cutoff:
+                        for behavior in new_models:
+                            _X_eval, _y_eval = [], []
+                            _stmt = select(
+                                NormalizedEvent.id,
+                                NormalizedEvent.raw_json,
+                                NormalizedEvent.event_id,
+                                NormalizedEvent.timestamp,
+                            ).where(NormalizedEvent.timestamp >= _holdout_cutoff)
+                            _rows = session.execute(_stmt).all()
+                            for _row_id, _raw, _eid, _ts in _rows:
+                                _beh = _behavior_of(int(_eid))
+                                if _beh != behavior:
+                                    continue
+                                _feats = event_feature_vector(
+                                    {
+                                        "event_id": _eid,
+                                        "raw_json": _raw or {},
+                                        "timestamp": _ts,
+                                    },
+                                    _shared_session=session,
+                                )
+                                if not _feats:
+                                    continue
+                                _X_eval.append(_feats)
+                                # Use heuristic label for evaluation
+                                _y_eval.append(
+                                    1
+                                    if MLAnomalyDetector._is_attack_sample(
+                                        int(_eid), _raw or {}
+                                    )
+                                    else 0
+                                )
+                            if len(_X_eval) >= 10 and len(set(_y_eval)) >= 2:
+                                _X_eval_arr = np.array(_X_eval, dtype=float)
+                                _y_eval_arr = np.array(_y_eval, dtype=int)
+                                _model = new_models[behavior]
+                                _scores = detector.score_events(
+                                    [list(f) for f in _X_eval_arr]
+                                )
+                                # Evaluate at the stream's new threshold
+                                _thresh = new_thresholds[behavior]
+                                _pred = np.array(_scores) > _thresh
+                                _tp = int(np.sum((_pred) & (_y_eval_arr == 1)))
+                                _fp = int(np.sum((_pred) & (_y_eval_arr == 0)))
+                                _fn = int(np.sum((~_pred) & (_y_eval_arr == 1)))
+                                _tn = int(np.sum((~_pred) & (_y_eval_arr == 0)))
+                                _recall = _tp / max(_tp + _fn, 1)
+                                _fpr = _fp / max(_fp + _tn, 1)
+                                _precision = _tp / max(_tp + _fp, 1)
+                                _holdout_metrics[behavior] = {
+                                    "recall": round(_recall, 4),
+                                    "fpr": round(_fpr, 4),
+                                    "precision": round(_precision, 4),
+                                    "threshold": round(_thresh, 3),
+                                    "samples": len(_X_eval),
+                                }
+            except Exception:
+                logger.exception("Hold-out evaluation failed")
+
             return {
                 "status": "ok",
                 "trained": True,
@@ -4670,6 +4816,7 @@ class MLAnomalyDetector:
                 "supervised": self.supervised_name,
                 "thresholds": self.thresholds,
                 "trained_at": self.trained_at,
+                "holdout_metrics": _holdout_metrics,
             }
         finally:
             if close:
@@ -4786,10 +4933,15 @@ class MLAnomalyDetector:
 
         Phase 2: Enhanced calibration with Platt scaling fallback and
         calibration quality validation via Brier score.
+
+        Phase 4: Cost-sensitive learning - false negatives (missed attacks)
+        are weighted 5x higher than false positives, since missing an attack
+        is worse than a false alarm in a SOC.
         """
         pos = int(y.sum())
         neg = int(len(y) - pos)
-        scale = (neg / max(pos, 1)) if pos and neg else 1.0
+        # Cost-sensitive: false negatives cost 5x false positives
+        cost_sensitive_scale = (neg / max(pos, 1)) * 5.0 if pos and neg else 1.0
         if HAS_XGBOOST and len(y) >= _XGB_MIN_SAMPLES:
             model = XGBClassifier(
                 n_estimators=120,
@@ -4797,7 +4949,7 @@ class MLAnomalyDetector:
                 learning_rate=0.08,
                 random_state=ML_RANDOM_STATE,
                 eval_metric="logloss",
-                scale_pos_weight=scale,
+                scale_pos_weight=cost_sensitive_scale,
                 subsample=0.9,
                 colsample_bytree=0.9,
                 min_child_weight=2,

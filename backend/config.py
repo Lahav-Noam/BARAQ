@@ -758,6 +758,19 @@ ML_MODEL_BUNDLE = Path(
 #: catching distribution tails (constant-false-alarm-rate calibration).
 ML_TARGET_FPR = float(os.environ.get("BARAQ_ML_TARGET_FPR", "0.10"))
 
+#: Per-stream false-positive rate budgets. Login events are frequent so keep
+#: FPR low; process/network events are rarer so tolerate more FPR for recall.
+#: JSON map like {"login": 0.05, "process": 0.15, "network": 0.10}.
+try:
+    _env_stream_fpr = json.loads(os.environ.get("BARAQ_ML_STREAM_FPR", "{}") or "{}")
+except (ValueError, TypeError):
+    _env_stream_fpr = {}
+ML_STREAM_FPR: dict[str, float] = {
+    "login": float(_env_stream_fpr.get("login", 0.05)),
+    "process": float(_env_stream_fpr.get("process", 0.15)),
+    "network": float(_env_stream_fpr.get("network", 0.10)),
+}
+
 #: Deployment mode for the ML layer.  The default is deliberately
 #: ``advisory``: event scores may influence analyst-facing risk, but the ML
 #: layer never triggers a response action on its own.  ``shadow`` stores
