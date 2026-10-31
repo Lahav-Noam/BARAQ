@@ -92,3 +92,8 @@ def test_recommended_threshold_returns_budgeted_point_on_ranked_stream():
 def test_recommended_threshold_needs_both_classes():
     assert _recommended_threshold([0] * 50, [0.1] * 50, 0.1) is None
     assert _recommended_threshold([1] * 50, [0.1] * 50, 0.1) is None
+
+
+def test_recommended_threshold_needs_both_classes():
+    assert _recommended_threshold([0] * 50, [0.1] * 50, 0.1) is None
+    assert _recommended_threshold([1] * 50, [0.1] * 50, 0.1) is None

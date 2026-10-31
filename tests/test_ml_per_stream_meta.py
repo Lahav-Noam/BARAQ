@@ -139,6 +139,26 @@ def test_threshold_from_scores_honours_fpr_budget():
     assert 0.2 < threshold < 0.9
 
 
+def test_threshold_safety_margin_targets_lower_fpr():
+    """A safety margin < 1.0 targets a lower FPR, raising the threshold."""
+    rng = np.random.RandomState(5)
+    scores = np.concatenate([rng.normal(0.2, 0.05, 400), rng.normal(0.9, 0.03, 20)])
+    labels = np.array([0] * 400 + [1] * 20)
+
+    thr_full, info_full = MLAnomalyDetector._threshold_from_scores(
+        scores, labels, 0.10, safety_margin=1.0
+    )
+    thr_half, info_half = MLAnomalyDetector._threshold_from_scores(
+        scores, labels, 0.10, safety_margin=0.5
+    )
+
+    # Half margin -> lower effective budget -> higher threshold -> fewer alerts
+    assert thr_half >= thr_full
+    assert info_half["effective_budget"] == 0.05
+    assert info_half["fpr"] <= 0.05
+    assert info_half["safety_margin"] == 0.5
+
+
 def test_threshold_from_scores_handles_missing_labels():
     scores = np.linspace(0, 1, 50)
     threshold, info = MLAnomalyDetector._threshold_from_scores(

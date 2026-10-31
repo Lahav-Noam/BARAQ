@@ -771,6 +771,25 @@ ML_STREAM_FPR: dict[str, float] = {
     "network": float(_env_stream_fpr.get("network", 0.10)),
 }
 
+#: Threshold safety margin applied to the configured FPR budget when choosing
+#: the operating point.  A margin of 0.5 targets 2.5 % FPR on a 5 % budget,
+#: giving headroom for distribution shift between the calibration window and
+#: the next deployment window.  Set to 1.0 to use the budget as-is.
+#: JSON map like {"login": 0.5} or single float applied to all streams.
+try:
+    _env_fpr_margin = json.loads(os.environ.get("BARAQ_ML_FPR_SAFETY_MARGIN", "{}") or "{}")
+except (ValueError, TypeError):
+    _env_fpr_margin = {}
+if isinstance(_env_fpr_margin, (int, float)):
+    _fpr_margin_all = float(_env_fpr_margin)
+    ML_FPR_SAFETY_MARGIN: dict[str, float] = {
+        s: _fpr_margin_all for s in ML_STREAM_FPR
+    }
+else:
+    ML_FPR_SAFETY_MARGIN: dict[str, float] = {
+        s: float(_env_fpr_margin.get(s, 1.0)) for s in ML_STREAM_FPR
+    }
+
 #: Deployment mode for the ML layer.  The default is deliberately
 #: ``advisory``: event scores may influence analyst-facing risk, but the ML
 #: layer never triggers a response action on its own.  ``shadow`` stores

@@ -211,12 +211,36 @@ pick anything but the booster, which is how the pooled learner collapsed.
 uses Platt scaling otherwise. Platt is strictly monotone, so per-event ranking
 survives calibration.
 
-### 4. Thresholds come from out-of-fold scores
+### 4. Thresholds come from out-of-fold scores with threshold-drift warning
+
 `_threshold_from_scores` picks the operating point from the deployed scoring
 path on rows the fold models never saw, instead of the in-sample CFAR quantile.
-That is what makes a configured FPR budget meaningful. The provenance
-(`out-of-fold` vs `cfar-only`, positives/negatives, measured recall/FPR) is
-returned by `train()` and written into the model metadata.
+That is what makes a configured FPR budget meaningful.
+
+The threshold is the lowest score where empirical FPR on the OOF benign rows is
+within ``target_fpr``, while maximising recall.  It uses only the held-out fold
+so the number reflects unseen data; it is not clamped to the in-sample CFAR
+quantile (that is how the configured 5 % FPR used to realise 15–20 % in
+production).
+
+Because the benign score distribution shifts between the training window and
+the next deployment window, the OOF threshold does not transfer perfectly.
+``train()`` now logs a ``WARNING`` when the OOF FPR exceeds the configured
+budget, and ``stream_health`` records the threshold source so operators can see
+when a stream is at risk of over-alerting.  The fix for drift is operational,
+not algorithmic: re-fit thresholds on a real shadow window before enabling
+autonomous response.
+
+The provenance (`out-of-fold` vs `cfar-only`, positives/negatives, measured
+recall/FPR, safety margin) is returned by `train()` and written into the model
+metadata.
+
+**Threshold safety margin** (`BARAQ_ML_FPR_SAFETY_MARGIN`): scales the FPR
+budget downward before choosing the threshold.  A margin of 0.5 on a 5 %
+budget targets 2.5 %, giving headroom for distribution shift between the
+calibration window and the next deployment window.  Set per stream via JSON
+map (``{"login": 0.5, "process": 0.8, "network": 1.0}``), or a single float
+applied to all streams.  Default is 1.0 (no margin — use the budget as-is).
 
 ### 5. The meta-learner is persisted
 The bundle never contained the ensemble, so every restart silently downgraded
@@ -279,9 +303,17 @@ reaches the login model and never the process one.
    estimate fragile: the hold-out slice is attack-enriched (73 positives / 263
    rows, versus 1.76 % in production), so the 95th percentile of the benign
    tail is estimated from only ~190 rows, and the campaigns themselves are what
-   changed between the two windows. Re-fit the boundary on a shadow window
-   before trusting the budget; a percentile from 190 benign rows is a point
-   estimate with a wide interval, not a contract.
+   changed between the two windows.
+
+   ``_threshold_from_scores`` now sets the threshold from OOF deployed scores
+   (the values serving will actually compare), not from the in-sample CFAR
+   quantile.  A threshold-drift warning is logged when the OOF FPR exceeds the
+   configured budget, and ``stream_health`` records the threshold source.  But
+   distribution shift cannot be fixed by threshold math alone: the benign score
+   distribution in the next window differs from training, so even a correctly
+   calibrated OOF threshold over-alerts on deployment. Re-fit the boundary on a
+   real shadow window before trusting the budget; an OOF percentile is a point
+   estimate, not a contract.
 4. **Network stream.** No labelled attacks in the training window and 4
    distinct benign scores across three seeds. The harness now reports it as
    `UNVALIDATED` and refuses to recommend a threshold below 10 distinct benign

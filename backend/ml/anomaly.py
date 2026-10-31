@@ -54,6 +54,7 @@ from backend.config import (
     ML_RETRAIN_MIN_NEW_VERDICTS,
     ML_STREAM_FPR,
     ML_TARGET_FPR,
+    ML_FPR_SAFETY_MARGIN,
     ML_TRAIN_MIN_SAMPLES,
     ML_VERSION_HISTORY,
 )
@@ -4701,13 +4702,42 @@ class MLAnomalyDetector:
 
                 for behavior, (oos, ooy) in (meta_result.get("oof") or {}).items():
                     target_fpr = ML_STREAM_FPR.get(behavior, ML_TARGET_FPR)
-                    thr, info = self._threshold_from_scores(oos, ooy, target_fpr)
+                    margin = ML_FPR_SAFETY_MARGIN.get(behavior, 1.0)
+                    thr, info = self._threshold_from_scores(
+                        oos, ooy, target_fpr, safety_margin=margin
+                    )
                     # Out-of-fold scores are authoritative: clamping this to the
                     # in-sample CFAR value is exactly how the configured 5% FPR
                     # used to realise 15% in production.
                     new_thresholds[behavior] = thr
                     info["target_fpr"] = target_fpr
+                    info["safety_margin"] = margin
                     threshold_sources[behavior] = info
+                    fpr = info.get("fpr")
+                    if fpr is not None and fpr > target_fpr:
+                        logger.warning(
+                            "ML threshold [%s] breaches FPR budget: oof_fpr=%s > "
+                            "target=%.1f%% (margin=%.2f, effective_budget=%.1f%%). "
+                            "Threshold fits this hold-out window but will likely "
+                            "over-alert on the next; re-fit on a shadow window "
+                            "before enabling autonomous response.",
+                            behavior,
+                            fpr,
+                            target_fpr * 100,
+                            margin,
+                            info.get("effective_budget", 0) * 100,
+                        )
+                    logger.info(
+                        "ML threshold [%s]: thr=%.4f oof_fpr=%s recall=%s "
+                        "neg=%s target=%.1f%% margin=%.2f",
+                        behavior,
+                        thr,
+                        info.get("fpr"),
+                        info.get("recall"),
+                        info.get("negatives"),
+                        target_fpr * 100,
+                        margin,
+                    )
                 if meta_result.get("oof"):
                     self.thresholds = new_thresholds
 
@@ -5138,7 +5168,7 @@ class MLAnomalyDetector:
 
     @staticmethod
     def _threshold_from_scores(
-        scores, labels, target_fpr: float
+        scores, labels, target_fpr: float, safety_margin: float = 1.0
     ) -> tuple[float, dict]:
         """Choose an operating point from **out-of-fold** deployed scores.
 
@@ -5148,6 +5178,15 @@ class MLAnomalyDetector:
         are already the values serving will compare against, computed on rows
         the fold models never saw, which is the only honest place to measure an
         FPR budget.
+
+        ``safety_margin`` (default 1.0) scales the FPR budget downward before
+        choosing the threshold.  A margin of 0.5 on a 5 % budget targets 2.5 %,
+        giving headroom for distribution shift between the calibration window
+        and the next deployment window.
+
+        The threshold is the lowest score where empirical FPR on the OOF benign
+        rows is within the (margin-adjusted) budget, while maximising recall.
+        It uses only the held-out fold so the number reflects unseen data.
 
         Returns ``(threshold, metrics)``.
         """
@@ -5159,23 +5198,22 @@ class MLAnomalyDetector:
             cfar = float(np.quantile(scores, 1.0 - target_fpr)) if len(scores) else 0.5
             return cfar, {"positives": pos, "negatives": neg, "source": "cfar-only"}
 
+        effective_budget = target_fpr * safety_margin
         benign = scores[y == 0]
-        cfar = float(np.quantile(benign, 1.0 - target_fpr))
+        cfar = float(np.quantile(benign, 1.0 - effective_budget))
         candidates = np.unique(np.round(scores, 9))
-        best_t, best_f1 = cfar, -1.0
+        best_t, best_recall = cfar, -1.0
+        best_fp = 0
         for t in candidates:
-            if t > cfar:
-                continue
             flagged = scores > t
             tp = int(np.sum(flagged & (y == 1)))
             fp = int(np.sum(flagged & (y == 0)))
-            if fp / neg > target_fpr:
+            if fp / neg > effective_budget:
                 continue
             recall = tp / pos
-            precision = tp / max(tp + fp, 1)
-            f1 = 2 * precision * recall / max(precision + recall, 1e-12)
-            if f1 > best_f1:
-                best_t, best_f1 = float(t), f1
+            if recall > best_recall:
+                best_t, best_recall = float(t), recall
+                best_fp = fp
         flagged = scores > best_t
         tp = int(np.sum(flagged & (y == 1)))
         fp = int(np.sum(flagged & (y == 0)))
@@ -5185,6 +5223,8 @@ class MLAnomalyDetector:
             "negatives": neg,
             "recall": round(tp / pos, 4),
             "fpr": round(fp / neg, 4),
+            "effective_budget": round(effective_budget, 4),
+            "safety_margin": safety_margin,
         }
 
     def _stream_score_health(

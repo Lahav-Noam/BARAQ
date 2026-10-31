@@ -160,16 +160,16 @@ def _recall_at_fpr(labels: list[int], scores: list[float], target_fpr: float) ->
 def _recommended_threshold(
     labels: list[int], scores: list[float], target_fpr: float
 ) -> dict | None:
-    """Threshold maximising F1 subject to ``FPR <= target_fpr``.
+    """Threshold maximising recall subject to empirical FPR <= target_fpr.
 
-    Candidates are the midpoints between *distinct* scores, so a stream whose
-    benign scores are concentrated on a few values still yields a usable split
-    instead of a quantile that lands exactly on the mass.
+    Candidates are the midpoints between *distinct* scores.  Uses only the
+    hold-out window so the number reflects unseen data; it is deliberately
+    optimistic (fits the window it measures) and labelled "recalibrate in
+    shadow" so operators don't mistake it for a production contract.
 
     Returns ``None`` when the stream is degenerate (fewer than
-    ``DEGENERATE_MIN_DISTINCT`` distinct benign scores): with four values a
-    midpoint can sit in an attack/benign gap and report "100 % recall at 0 %
-    FPR" that says nothing about ranking. ``_score_health`` reports the reason.
+    ``DEGENERATE_MIN_DISTINCT`` distinct benign scores) or when no threshold
+    satisfies the FPR constraint.
     """
     import numpy as np
 
@@ -189,7 +189,7 @@ def _recommended_threshold(
         m = _metrics(labels, scores, float(t))
         if m["fpr"] > target_fpr:
             continue
-        if best is None or m["f1"] > best["f1"]:
+        if best is None or m["recall"] > best["recall"]:
             best = m
     if best is None:
         return None
